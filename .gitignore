@@ -1,0 +1,11 @@
+# Binaries
+*.exe
+*.out
+/bin/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
