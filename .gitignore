@@ -6,6 +6,17 @@
 # Environment
 .env
 
+# Secrets
+gsm.json
+credentials.json
+
+# Local runtime data
+users.json
+users.json.migrated
+whatsmeow.db
+whatsmeow.db-*
+bot.log
+
 # IDE
 .vscode/
 .idea/
