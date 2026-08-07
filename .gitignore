@@ -15,7 +15,7 @@ users.json
 users.json.migrated
 whatsmeow.db
 whatsmeow.db-*
-bot.log
+*.log
 
 # IDE
 .vscode/
