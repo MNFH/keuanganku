@@ -18,27 +18,29 @@ go test ./internal/model -run TestFormatAmount     # one test
 go test ./internal/model -run 'TestFormatAmount/negative_six_digits' -v   # one subtest
 ```
 
-Only `internal/model` and `internal/handler` have tests so far, covering the pure
-functions (`FormatAmount`, `BalanceDelta`, `parseAmount`). The other obvious candidates
-— `recap.Compute`, the `*Range` helpers, `ParseIndoMonth`, `matchWalletPrefix`,
-`parseTransactionRow`, `nextFireTime` — are equally dependency-free and still untested.
+Tested: `internal/model` (`FormatAmount`, `BalanceDelta`), `internal/handler` (`parseAmount`),
+`internal/ai` (`Intent.Command`, `Mutates`, `normalize`), `internal/telegram` (`ToHTML`), and
+`internal/whatsappcloud` (webhook signature verification, the verify handshake, payload
+parsing). Still untested but equally dependency-free: `recap.Compute`, the `*Range` helpers,
+`ParseIndoMonth`, `matchWalletPrefix`, `parseTransactionRow`, `nextFireTime`.
 
-Note `gofmt -l .` lists every file in the repo: this is a Windows CRLF checkout and
-gofmt expects LF. That is the pre-existing baseline, not a real formatting problem —
-don't "fix" it by rewriting every file.
+No test hits a network service, so `ai.Parser.Parse` and every transport's actual I/O are
+uncovered. `cmd/smoke` exercises the live Gemini path by hand (text and `-image`); it needs a
+real API key and costs quota, so run it deliberately rather than in CI.
+
+`gofmt -l .` lists every file: this is a Windows CRLF checkout and gofmt expects LF. Mostly a
+false positive — but a few files do have real alignment drift, so check `gofmt -d <file>`
+before assuming. Don't run `gofmt -w .` across the repo; it buries a real diff in noise.
 
 Running the bot requires `MYSQL_DSN` in `.env` (the process calls `log.Fatalf` if it is
 missing) plus a Google service-account JSON at `GOOGLE_CREDENTIALS_FILE`
-(default `credentials.json`). First run prints a QR code to link a WhatsApp account;
-the session persists in `whatsmeow.db` so later restarts reconnect without rescanning.
-
-Note `.env.example` lists two stale variables, `ANTHROPIC_API_KEY` and
-`GOOGLE_SHEETS_SPREADSHEET_ID`, that `config.Load` never reads — only `MYSQL_DSN` and
-`GOOGLE_CREDENTIALS_FILE` are real.
+(default `credentials.json`). With the default whatsmeow transport, the first run prints a QR
+code to link a WhatsApp account and persists the session in `whatsmeow.db`.
 
 ## Architecture
 
-A WhatsApp chat bot for personal finance, driven entirely by slash commands in a chat.
+A personal-finance chat bot serving WhatsApp and Telegram, driven by slash commands or by
+free-form Indonesian messages and receipt photos.
 
 ### Three stores, and which data lives where
 
@@ -49,21 +51,89 @@ by calling Sheets an "optional export":
   two tabs created and headed by `sheets.InitSheets`: `Wallets` (Name, Balance, Created At)
   and `Transactions` (ID, Date, Type, Amount, Wallet, Category, Description, RefID, Direction).
   All reads and writes of financial data go through `internal/sheets`.
-- **MySQL holds only the `users` table** — a `chat JID → spreadsheet_id` mapping, auto-migrated
+- **MySQL holds only the `users` table** — a `chat ID → spreadsheet_id` mapping, auto-migrated
   on startup by `userstore.New`. The database itself must already exist; only the table is created.
 - **SQLite (`whatsmeow.db`)** holds the WhatsApp device session, owned by whatsmeow's `sqlstore`.
 
-### Message flow
+### Message flow, and the transport boundary
 
-`cmd/api/main.go` registers one whatsmeow event handler that filters messages (ignoring
-anything empty, and ignoring the bot's own messages unless they start with `/`), then calls
-`handler.Handle(ctx, chatJID, text)`. The handler **never sends anything** — it returns a
+The bot serves **three chat transports**. `handler.Handle(ctx, chatID, handler.Message{...})`
+is platform-agnostic: it takes an opaque chat ID, and **never sends anything** — it returns a
 `handler.Reply` that is either `Text`, or a `Document` + `Filename` + `Caption`, or zero-value
-meaning "send nothing". The caller decides how to deliver it. `internal/wasend` does document
-uploads and is shared by `main.go` and the scheduler, which is the reason it exists as its own
-package.
+meaning "send nothing". Keep it that way; it is what let Telegram and the Cloud API be
+transports rather than forks.
 
-Keying off the **chat** JID, not the sender, means a group chat shares one spreadsheet.
+- `internal/messaging` defines `Sender` (`SendText`, `SendDocument`) and a `Router` that picks
+  the transport from the chat ID.
+- Three transports: `internal/wasend` (whatsmeow linked device), `internal/telegram`
+  (long-polling Bot API), `internal/whatsappcloud` (official Graph API + webhook). All three
+  talk plain HTTP where possible rather than wrapper libraries.
+- `cmd/api/main.go` holds each event loop, but they all funnel into one `dispatch` function, so
+  their behaviour cannot drift apart. Add platform handling there, not in the handler.
+
+**Chat ID scheme:** prefixed per platform (`tg:123456`, `wac:628123456789`) except whatsmeow,
+whose IDs stay bare as the JID string they have always been. Prefixing only the newer platforms
+meant the existing `users` rows stayed valid and no migration was ever needed — preserve that
+asymmetry when adding a transport.
+
+**The 24-hour window (Cloud API only).** Meta rejects free-form messages, documents included,
+more than 24 hours after the user's last message. `whatsappcloud` surfaces Meta's error 131047
+as `messaging.ErrOutsideWindow`, and implements `messaging.Reengager` to send an approved
+template instead. The scheduler checks for that sentinel and falls back to a nudge rather than
+dropping the monthly report silently. A template **cannot** carry the PDF — only the user
+making contact reopens the window — so the nudge asks them to reply, and `/rekap` then serves
+the report. Keep the sentinel in `messaging`, not the transport, so callers never import a
+specific platform.
+
+**The webhook is a public endpoint.** `whatsappcloud.Webhook` verifies Meta's
+`X-Hub-Signature-256` HMAC on every POST and refuses everything when no app secret is set —
+failing closed, because an unauthenticated endpoint here lets anyone write transactions into a
+user's ledger. It also answers 200 before doing the work, since Meta retries anything slow and
+a retry would double-record the transaction.
+
+Keying off the **chat** ID, not the sender, means a group chat shares one spreadsheet.
+
+The scheduler takes a `messaging.Sender` (the `Router`), not a whatsmeow client. Anything that
+delivers to users must go through the router, or it will silently serve only one platform.
+
+Telegram replies go through `telegram.ToHTML`, which converts the bot's WhatsApp-flavoured
+`*bold*` / `_italic_` markup to Telegram HTML and escapes `& < >` first. Escaping must precede
+markup conversion: Telegram rejects a message whose entities don't parse, so a stray `&` would
+lose the reply entirely rather than just look wrong.
+
+### Natural language is a translator, not a second execution path
+
+`internal/ai` (Gemini) converts a free-form message or receipt photo into a structured
+`ai.Intent`, and `Intent.Command()` renders that as a **canonical slash command** which is then
+run through the same `handleCommand` dispatch as typed input. `Handle` splits the two cases;
+`handleNaturalLanguage` does the parse-then-dispatch.
+
+This boundary is the design, not an implementation detail — keep it:
+
+- The model never touches the spreadsheet. Every rule (amount validation, wallet matching,
+  balance bookkeeping, rollback) is enforced exactly once, on the command path, so a misread
+  cannot bypass a constraint that typed input must satisfy.
+- `Command()` returns `ok == false` for anything incomplete — no amount, no wallet, a transfer
+  to the same wallet, a non-positive amount — and the caller **asks** rather than guessing. A
+  guessed transaction writes silently to someone's ledger.
+- Unrecognized chatter returns `ActionUnknown` with an **empty** `Reply`, and the handler stays
+  silent. This is deliberate: the bot sits in group chats, where answering every message would
+  be noise. A non-empty `Reply` means "looked financial but something's missing" — ask that.
+- `handler.IntentParser` is an interface and `MessageHandler.parser` may be **nil**. With no
+  `GEMINI_API_KEY` the bot runs exactly as before, slash commands only. Don't introduce a hard
+  dependency on the parser being present.
+- Infra errors are surfaced only when the message carried an image (a deliberate act); for
+  plain prose they're logged and swallowed, again to avoid group-chat noise.
+
+Two constraints on generated commands, both covered by `internal/ai/command_test.go`:
+**category must be a single token** (the handler reads one word after the wallet as the category,
+so a two-word category eats the description's first word), and **descriptions are collapsed to
+one line** (commands are split with `strings.Fields`). Multi-word *wallet* names need no quoting
+— `matchWalletPrefix` matches them greedily from the front.
+
+`ai.Categories` is a closed vocabulary on purpose: the recap breakdown and the PDF chart only
+group usefully when the same spending lands under the same label every time. Add to the list
+rather than letting the model invent labels.
 
 ### Sheets client caching
 
@@ -129,6 +199,13 @@ logic and Indonesian month parsing/formatting live there and not in the handler.
 `report.GenerateMonthly(title, txs, wallets)` returns raw PDF bytes, used by both the on-demand
 `/rekap ... pdf` path and `internal/scheduler`, which fires on the 1st of each month at 07:00
 local time (`fireDay`/`fireHour`) and sends the previous full month to every registered chat.
+
+**The scheduler is opt-in** (`ENABLE_MONTHLY_REPORT`), and off by default. It is the only thing
+the bot sends unprompted, which on the WhatsApp Cloud API means a billable template
+conversation instead of a free reply inside the 24-hour window. `main.go` also mirrors the flag
+onto `MessageHandler.MonthlyReports` so `/help` only promises the automatic report when it is
+actually running — don't reintroduce that claim unconditionally. Everything the user asks for
+directly, `/rekap ... pdf` included, is unaffected and free.
 
 ## Conventions
 

@@ -62,15 +62,6 @@ type Wallet struct {
 	Balance float64 `json:"balance"`
 }
 
-type ParsedIntent struct {
-	Action      string          `json:"action"`       // add_income, add_expense, add_wallet, list_wallets, summary
-	Amount      float64         `json:"amount"`
-	Wallet      string          `json:"wallet"`
-	Category    string          `json:"category"`
-	Description string          `json:"description"`
-	WalletName  string          `json:"wallet_name"` // for add_wallet action
-}
-
 // FormatAmount renders a rupiah amount with "." as the thousands separator,
 // e.g. 500000 -> "500.000" and -500000 -> "-500.000".
 //

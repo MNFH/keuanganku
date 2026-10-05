@@ -4,17 +4,16 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
 
+	"github.com/nurfaizh/keuanganku/internal/messaging"
 	"github.com/nurfaizh/keuanganku/internal/recap"
 	"github.com/nurfaizh/keuanganku/internal/report"
 	"github.com/nurfaizh/keuanganku/internal/sheets"
 	"github.com/nurfaizh/keuanganku/internal/userstore"
-	"github.com/nurfaizh/keuanganku/internal/wasend"
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/types"
 )
 
 // fireDay and fireHour control when the monthly report is sent: the 1st of
@@ -27,11 +26,13 @@ const (
 type Scheduler struct {
 	users       *userstore.Store
 	credentials string
-	waClient    *whatsmeow.Client
+	// sender routes each report to whichever chat platform the registered
+	// chat belongs to, so Telegram users get their monthly PDF too.
+	sender messaging.Sender
 }
 
-func New(users *userstore.Store, credentials string, waClient *whatsmeow.Client) *Scheduler {
-	return &Scheduler{users: users, credentials: credentials, waClient: waClient}
+func New(users *userstore.Store, credentials string, sender messaging.Sender) *Scheduler {
+	return &Scheduler{users: users, credentials: credentials, sender: sender}
 }
 
 // Run blocks, sending the monthly report each time the schedule fires, until
@@ -97,13 +98,25 @@ func (s *Scheduler) sendReportFor(ctx context.Context, jidStr, spreadsheetID, ti
 		return fmt.Errorf("generate pdf: %w", err)
 	}
 
-	jid, err := types.ParseJID(jidStr)
-	if err != nil {
-		return fmt.Errorf("parse jid: %w", err)
-	}
-
 	filename := fmt.Sprintf("Rekap-%s-%d.pdf", recap.IndoMonthName(from.Month()), from.Year())
-	if err := wasend.SendDocument(ctx, s.waClient, jid, pdf, filename, title); err != nil {
+	if err := s.sender.SendDocument(ctx, jidStr, pdf, filename, title); err != nil {
+		// Some transports refuse an unsolicited message. The WhatsApp Cloud
+		// API only permits free-form content, documents included, within 24
+		// hours of the user's own last message — and a monthly report fired
+		// at 07:00 on the 1st will usually fall outside that. The report
+		// cannot be pushed, so prompt the user to make contact; once they do,
+		// /rekap delivers it on demand.
+		if errors.Is(err, messaging.ErrOutsideWindow) {
+			re, ok := s.sender.(messaging.Reengager)
+			if !ok {
+				return fmt.Errorf("send document: %w", err)
+			}
+			if reErr := re.Reengage(ctx, jidStr, "monthly report"); reErr != nil {
+				return fmt.Errorf("send document: %w; re-engagement also failed: %v", err, reErr)
+			}
+			log.Printf("Scheduler: %s is outside the messaging window, sent a re-engagement prompt instead", jidStr)
+			return nil
+		}
 		return fmt.Errorf("send document: %w", err)
 	}
 
