@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -70,18 +71,33 @@ type ParsedIntent struct {
 	WalletName  string          `json:"wallet_name"` // for add_wallet action
 }
 
-// FormatAmount renders a rupiah amount with "." as the thousands separator, e.g. 500000 -> "500.000".
+// FormatAmount renders a rupiah amount with "." as the thousands separator,
+// e.g. 500000 -> "500.000" and -500000 -> "-500.000".
+//
+// The sign is stripped before grouping: counting it as a digit shifts every
+// separator position, which rendered negatives as "-.500.000".
 func FormatAmount(amount float64) string {
 	s := fmt.Sprintf("%.0f", amount)
-	if len(s) <= 3 {
-		return s
+
+	sign := ""
+	if digits, negative := strings.CutPrefix(s, "-"); negative {
+		s = digits
+		// An amount that rounds to zero shouldn't render as "-0".
+		if strings.Trim(digits, "0") != "" {
+			sign = "-"
+		}
 	}
+
+	if len(s) <= 3 {
+		return sign + s
+	}
+
 	var result []byte
-	for i, c := range s {
+	for i := 0; i < len(s); i++ {
 		if i > 0 && (len(s)-i)%3 == 0 {
 			result = append(result, '.')
 		}
-		result = append(result, byte(c))
+		result = append(result, s[i])
 	}
-	return string(result)
+	return sign + string(result)
 }

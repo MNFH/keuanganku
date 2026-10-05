@@ -22,6 +22,12 @@ const (
 // ErrNoTransactions is returned when there is nothing to undo.
 var ErrNoTransactions = errors.New("no transactions found")
 
+// ErrInconsistent is wrapped into errors returned when a multi-step write
+// failed partway and could not be rolled back, so wallet balances and
+// transaction rows no longer agree and the sheet needs manual review.
+// Callers must surface this to the user rather than reporting a plain failure.
+var ErrInconsistent = errors.New("spreadsheet left inconsistent")
+
 type Client struct {
 	svc           *sheets.Service
 	spreadsheetID string
@@ -144,13 +150,22 @@ func (c *Client) AddWallet(ctx context.Context, name string) error {
 	return c.appendRow(ctx, sheetWallets+"!A:C", []interface{}{name, 0, time.Now().Format("2006-01-02 15:04:05")})
 }
 
+// AddTransaction records tx: it appends the transaction row, then applies the
+// transaction's effect to its wallet's balance.
+//
+// The wallet row is resolved before anything is written, so an unknown wallet
+// fails without leaving a partial write behind. Sheets has no multi-write
+// transaction, so the row is appended *before* the balance is updated: if the
+// balance write then fails, the sheet is left with a visible transaction row
+// rather than silent balance drift, and that row is rolled back when possible.
+// An error wrapping ErrInconsistent means the rollback itself failed.
 func (c *Client) AddTransaction(ctx context.Context, tx model.Transaction) error {
-	if err := c.AdjustWalletBalance(ctx, tx.Wallet, tx.BalanceDelta()); err != nil {
+	row, balance, err := c.findWalletRow(ctx, tx.Wallet)
+	if err != nil {
 		return err
 	}
 
-	// Append transaction row
-	return c.appendRow(ctx, sheetTransactions+"!A:I", []interface{}{
+	if err := c.appendRow(ctx, sheetTransactions+"!A:I", []interface{}{
 		tx.ID,
 		tx.Date.Format("2006-01-02 15:04:05"),
 		string(tx.Type),
@@ -160,7 +175,32 @@ func (c *Client) AddTransaction(ctx context.Context, tx model.Transaction) error
 		tx.Description,
 		tx.RefID,
 		string(tx.Direction),
-	})
+	}); err != nil {
+		return err
+	}
+
+	if err := c.setWalletBalance(ctx, row, balance+tx.BalanceDelta()); err != nil {
+		if rbErr := c.deleteRowIfLastWithID(ctx, tx.ID); rbErr != nil {
+			return fmt.Errorf("%w: %v; transaction row could not be removed: %v", ErrInconsistent, err, rbErr)
+		}
+		return err
+	}
+	return nil
+}
+
+// deleteRowIfLastWithID removes the final transaction row if it still carries
+// the given ID, rolling back an append whose follow-up write failed. It
+// refuses to delete a row that is no longer the last one, since that row
+// belongs to some other write.
+func (c *Client) deleteRowIfLastWithID(ctx context.Context, id string) error {
+	last, rowNumber, err := c.GetLastTransaction(ctx)
+	if err != nil {
+		return fmt.Errorf("locate appended row: %w", err)
+	}
+	if last.ID != id {
+		return fmt.Errorf("appended row is no longer the last row")
+	}
+	return c.DeleteTransactionRow(ctx, rowNumber)
 }
 
 // AdjustWalletBalance adds delta (positive or negative) to a wallet's balance.
@@ -169,11 +209,15 @@ func (c *Client) AdjustWalletBalance(ctx context.Context, walletName string, del
 	if err != nil {
 		return err
 	}
+	return c.setWalletBalance(ctx, row, currentBalance+delta)
+}
 
+// setWalletBalance writes an absolute balance to a wallet's 1-indexed sheet row.
+func (c *Client) setWalletBalance(ctx context.Context, row int, balance float64) error {
 	balanceRange := fmt.Sprintf("%s!B%d", sheetWallets, row)
-	err = c.withRecovery(ctx, func() error {
+	err := c.withRecovery(ctx, func() error {
 		_, innerErr := c.svc.Spreadsheets.Values.Update(c.spreadsheetID, balanceRange,
-			&sheets.ValueRange{Values: [][]interface{}{{currentBalance + delta}}}).
+			&sheets.ValueRange{Values: [][]interface{}{{balance}}}).
 			ValueInputOption("RAW").Context(ctx).Do()
 		return innerErr
 	})
