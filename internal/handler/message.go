@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -143,7 +144,7 @@ func (h *MessageHandler) cmdMasuk(ctx context.Context, sc *sheets.Client, args [
 	}
 	amount, err := parseAmount(args[0])
 	if err != nil {
-		return fmt.Sprintf("❌ Nominal tidak valid: *%s*\nContoh: 50000, 50rb, 1.5jt, 200k", args[0])
+		return amountErrorMsg(args[0], err)
 	}
 	return addTransaction(ctx, sc, model.Income, amount, args[1:])
 }
@@ -155,7 +156,7 @@ func (h *MessageHandler) cmdKeluar(ctx context.Context, sc *sheets.Client, args 
 	}
 	amount, err := parseAmount(args[0])
 	if err != nil {
-		return fmt.Sprintf("❌ Nominal tidak valid: *%s*\nContoh: 50000, 50rb, 1.5jt, 200k", args[0])
+		return amountErrorMsg(args[0], err)
 	}
 	return addTransaction(ctx, sc, model.Expense, amount, args[1:])
 }
@@ -194,7 +195,7 @@ func (h *MessageHandler) cmdTransfer(ctx context.Context, sc *sheets.Client, arg
 	}
 	amount, err := parseAmount(args[0])
 	if err != nil {
-		return fmt.Sprintf("❌ Nominal tidak valid: *%s*\nContoh: 50000, 50rb, 1.5jt, 200k", args[0])
+		return amountErrorMsg(args[0], err)
 	}
 
 	wallets, err := sc.GetWallets(ctx)
@@ -242,6 +243,9 @@ func (h *MessageHandler) cmdTransfer(ctx context.Context, sc *sheets.Client, arg
 		RefID:       refID,
 	}
 	if err := sc.AddTransaction(ctx, outTx); err != nil {
+		if errors.Is(err, sheets.ErrInconsistent) {
+			return fmt.Sprintf("❌ Transfer gagal dan spreadsheet perlu diperiksa manual. Error: %v", err)
+		}
 		return fmt.Sprintf("❌ Gagal memproses transfer: %v", err)
 	}
 
@@ -662,6 +666,9 @@ func addTransaction(ctx context.Context, sc *sheets.Client, txType model.Transac
 	}
 
 	if err := sc.AddTransaction(ctx, tx); err != nil {
+		if errors.Is(err, sheets.ErrInconsistent) {
+			return fmt.Sprintf("❌ Transaksi gagal disimpan dan spreadsheet perlu diperiksa manual. Error: %v", err)
+		}
 		return fmt.Sprintf("❌ Gagal menyimpan transaksi: %v", err)
 	}
 
@@ -770,7 +777,31 @@ func parseAmount(s string) (float64, error) {
 
 	val, err := strconv.ParseFloat(s, 64)
 	if err != nil {
-		return 0, err
+		return 0, errAmountInvalid
 	}
-	return val * multiplier, nil
+	val *= multiplier
+
+	// ParseFloat also accepts "NaN" and "Inf", and nothing downstream checks the
+	// sign. A negative expense would invert its BalanceDelta and *raise* the
+	// wallet balance, so reject anything that isn't a real positive amount.
+	if math.IsNaN(val) || math.IsInf(val, 0) {
+		return 0, errAmountInvalid
+	}
+	if val <= 0 {
+		return 0, errAmountNotPositive
+	}
+	return val, nil
+}
+
+var (
+	errAmountInvalid     = errors.New("invalid amount")
+	errAmountNotPositive = errors.New("amount must be positive")
+)
+
+// amountErrorMsg renders a parseAmount failure as a user-facing message.
+func amountErrorMsg(raw string, err error) string {
+	if errors.Is(err, errAmountNotPositive) {
+		return fmt.Sprintf("❌ Nominal harus lebih dari nol: *%s*", raw)
+	}
+	return fmt.Sprintf("❌ Nominal tidak valid: *%s*\nContoh: 50000, 50rb, 1.5jt, 200k", raw)
 }
