@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nurfaizh/keuanganku/internal/model"
@@ -17,7 +19,17 @@ import (
 const (
 	sheetWallets      = "Wallets"
 	sheetTransactions = "Transactions"
+
+	// txRange covers every Transactions column, J (Canceled At) included.
+	txRange = sheetTransactions + "!A2:J"
+
+	// canceledHeader titles column J, which holds the time a transaction was
+	// soft-deleted by /batal. Empty means the transaction is active.
+	canceledHeader = "Canceled At"
 )
+
+// transactionHeaders is the Transactions tab's header row.
+var transactionHeaders = []interface{}{"ID", "Date", "Type", "Amount", "Wallet", "Category", "Description", "RefID", "Direction", canceledHeader}
 
 // ErrNoTransactions is returned when there is nothing to undo.
 var ErrNoTransactions = errors.New("no transactions found")
@@ -31,6 +43,11 @@ var ErrInconsistent = errors.New("spreadsheet left inconsistent")
 type Client struct {
 	svc           *sheets.Service
 	spreadsheetID string
+
+	// formulaMu serialises wallet-formula migration; formulasReady skips it
+	// once it has succeeded for this client (see ensureWalletFormulas).
+	formulaMu     sync.Mutex
+	formulasReady atomic.Bool
 }
 
 func New(credentialsFile, spreadsheetID string) (*Client, error) {
@@ -75,12 +92,12 @@ func (c *Client) InitSheets(ctx context.Context) error {
 
 	// Write headers if sheets were just created
 	if !existing[sheetWallets] {
-		if err := c.writeRow(ctx, sheetWallets+"!A1", []interface{}{"Name", "Balance", "Created At"}); err != nil {
+		if err := c.writeRow(ctx, sheetWallets+"!A1", walletHeaders); err != nil {
 			return err
 		}
 	}
 	if !existing[sheetTransactions] {
-		if err := c.writeRow(ctx, sheetTransactions+"!A1", []interface{}{"ID", "Date", "Type", "Amount", "Wallet", "Category", "Description", "RefID", "Direction"}); err != nil {
+		if err := c.writeRow(ctx, sheetTransactions+"!A1", transactionHeaders); err != nil {
 			return err
 		}
 	}
@@ -109,63 +126,24 @@ func (c *Client) withRecovery(ctx context.Context, fn func() error) error {
 	if recErr := c.InitSheets(ctx); recErr != nil {
 		return err
 	}
+	// A recreated tab breaks the balance formulas (#REF!); re-check them on
+	// the next GetWallets.
+	c.formulasReady.Store(false)
 	return fn()
 }
 
-func (c *Client) GetWallets(ctx context.Context) ([]model.Wallet, error) {
-	var resp *sheets.ValueRange
-	err := c.withRecovery(ctx, func() error {
-		var innerErr error
-		resp, innerErr = c.svc.Spreadsheets.Values.Get(c.spreadsheetID, sheetWallets+"!A2:B").Context(ctx).Do()
-		return innerErr
-	})
-	if err != nil {
-		return nil, fmt.Errorf("get wallets: %w", err)
-	}
-
-	var wallets []model.Wallet
-	for _, row := range resp.Values {
-		if len(row) < 2 {
-			continue
-		}
-		balance, _ := strconv.ParseFloat(fmt.Sprint(row[1]), 64)
-		wallets = append(wallets, model.Wallet{
-			Name:    fmt.Sprint(row[0]),
-			Balance: balance,
-		})
-	}
-	return wallets, nil
-}
-
-func (c *Client) AddWallet(ctx context.Context, name string) error {
-	wallets, err := c.GetWallets(ctx)
-	if err != nil {
-		return err
-	}
-	for _, w := range wallets {
-		if w.Name == name {
-			return fmt.Errorf("wallet %q already exists", name)
-		}
-	}
-	return c.appendRow(ctx, sheetWallets+"!A:C", []interface{}{name, 0, time.Now().Format("2006-01-02 15:04:05")})
-}
-
-// AddTransaction records tx: it appends the transaction row, then applies the
-// transaction's effect to its wallet's balance.
+// AddTransaction records tx by appending its row. That is the whole write:
+// the wallet's balance is a formula over the Transactions tab (see
+// wallets.go), so there is no second write to keep in sync or roll back.
 //
-// The wallet row is resolved before anything is written, so an unknown wallet
-// fails without leaving a partial write behind. Sheets has no multi-write
-// transaction, so the row is appended *before* the balance is updated: if the
-// balance write then fails, the sheet is left with a visible transaction row
-// rather than silent balance drift, and that row is rolled back when possible.
-// An error wrapping ErrInconsistent means the rollback itself failed.
+// The wallet is checked first so an unknown wallet fails before anything is
+// written — the formula would otherwise silently ignore the row.
 func (c *Client) AddTransaction(ctx context.Context, tx model.Transaction) error {
-	row, balance, err := c.findWalletRow(ctx, tx.Wallet)
-	if err != nil {
+	if err := c.walletExists(ctx, tx.Wallet); err != nil {
 		return err
 	}
 
-	if err := c.appendRow(ctx, sheetTransactions+"!A:I", []interface{}{
+	return c.appendRow(ctx, sheetTransactions+"!A:I", []interface{}{
 		tx.ID,
 		tx.Date.Format("2006-01-02 15:04:05"),
 		string(tx.Type),
@@ -175,24 +153,15 @@ func (c *Client) AddTransaction(ctx context.Context, tx model.Transaction) error
 		tx.Description,
 		tx.RefID,
 		string(tx.Direction),
-	}); err != nil {
-		return err
-	}
-
-	if err := c.setWalletBalance(ctx, row, balance+tx.BalanceDelta()); err != nil {
-		if rbErr := c.deleteRowIfLastWithID(ctx, tx.ID); rbErr != nil {
-			return fmt.Errorf("%w: %v; transaction row could not be removed: %v", ErrInconsistent, err, rbErr)
-		}
-		return err
-	}
-	return nil
+	})
 }
 
-// deleteRowIfLastWithID removes the final transaction row if it still carries
-// the given ID, rolling back an append whose follow-up write failed. It
-// refuses to delete a row that is no longer the last one, since that row
-// belongs to some other write.
-func (c *Client) deleteRowIfLastWithID(ctx context.Context, id string) error {
+// RemoveIfLast hard-deletes the final transaction row if it still carries the
+// given ID, rolling back a multi-row write (a transfer's first leg) whose
+// next step failed — that transaction never happened, so it is removed
+// rather than marked canceled. It refuses to delete a row that is no longer
+// the last one, since that row belongs to some other write.
+func (c *Client) RemoveIfLast(ctx context.Context, id string) error {
 	last, rowNumber, err := c.GetLastTransaction(ctx)
 	if err != nil {
 		return fmt.Errorf("locate appended row: %w", err)
@@ -203,87 +172,141 @@ func (c *Client) deleteRowIfLastWithID(ctx context.Context, id string) error {
 	return c.DeleteTransactionRow(ctx, rowNumber)
 }
 
-// AdjustWalletBalance adds delta (positive or negative) to a wallet's balance.
-func (c *Client) AdjustWalletBalance(ctx context.Context, walletName string, delta float64) error {
-	row, currentBalance, err := c.findWalletRow(ctx, walletName)
-	if err != nil {
-		return err
-	}
-	return c.setWalletBalance(ctx, row, currentBalance+delta)
-}
-
-// setWalletBalance writes an absolute balance to a wallet's 1-indexed sheet row.
-func (c *Client) setWalletBalance(ctx context.Context, row int, balance float64) error {
-	balanceRange := fmt.Sprintf("%s!B%d", sheetWallets, row)
+// readTransactionRows returns every raw data row of the Transactions tab;
+// index i is sheet row i+2.
+func (c *Client) readTransactionRows(ctx context.Context) ([][]interface{}, error) {
+	var resp *sheets.ValueRange
 	err := c.withRecovery(ctx, func() error {
-		_, innerErr := c.svc.Spreadsheets.Values.Update(c.spreadsheetID, balanceRange,
-			&sheets.ValueRange{Values: [][]interface{}{{balance}}}).
-			ValueInputOption("RAW").Context(ctx).Do()
+		var innerErr error
+		resp, innerErr = c.svc.Spreadsheets.Values.Get(c.spreadsheetID, txRange).Context(ctx).Do()
 		return innerErr
 	})
 	if err != nil {
-		return fmt.Errorf("update wallet balance: %w", err)
+		return nil, fmt.Errorf("get transactions: %w", err)
+	}
+	return resp.Values, nil
+}
+
+// TxRow is a transaction together with its 1-indexed sheet row.
+type TxRow struct {
+	Tx  model.Transaction
+	Row int
+}
+
+// LastActiveEntry returns what /batal should undo next: the most recent
+// transaction that has not already been canceled, plus the other leg when it
+// is a transfer. Canceled rows are skipped, so repeated /batal walks back
+// through history one entry at a time instead of hitting the same row again.
+// Returns ErrNoTransactions when nothing is left to undo.
+func (c *Client) LastActiveEntry(ctx context.Context) ([]TxRow, error) {
+	rows, err := c.readTransactionRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	txs := make([]*model.Transaction, len(rows))
+	for i, row := range rows {
+		if tx, perr := parseTransactionRow(row); perr == nil {
+			txs[i] = &tx
+		}
+	}
+	idxs := lastActiveEntry(txs)
+	if len(idxs) == 0 {
+		return nil, ErrNoTransactions
+	}
+	out := make([]TxRow, len(idxs))
+	for i, idx := range idxs {
+		out[i] = TxRow{Tx: *txs[idx], Row: idx + 2}
+	}
+	return out, nil
+}
+
+// lastActiveEntry picks the slice indices /batal should undo. txs[i] is nil
+// for a malformed row, which is never a candidate. For a transfer, the other
+// leg is the nearest active row above that shares its RefID — normally the
+// row directly above, since the out leg is written first.
+func lastActiveEntry(txs []*model.Transaction) []int {
+	for i := len(txs) - 1; i >= 0; i-- {
+		tx := txs[i]
+		if tx == nil || tx.Canceled {
+			continue
+		}
+		if tx.RefID == "" {
+			return []int{i}
+		}
+		for j := i - 1; j >= 0; j-- {
+			if p := txs[j]; p != nil && !p.Canceled && p.RefID == tx.RefID {
+				return []int{i, j}
+			}
+		}
+		// The other leg is missing or already canceled (a partly-failed
+		// write, or a hand edit): undo the leg we have.
+		return []int{i}
 	}
 	return nil
 }
 
-// findWalletRow returns the 1-indexed sheet row and current balance of a wallet.
-func (c *Client) findWalletRow(ctx context.Context, walletName string) (row int, balance float64, err error) {
-	wallets, err := c.GetWallets(ctx)
-	if err != nil {
-		return -1, 0, err
+// SetCanceled marks (or, with canceled false, unmarks) the given sheet rows as
+// soft-deleted, in a single API call so a transfer's two legs change together.
+// It also (re)writes the column header, so sheets created before column J
+// existed get it on their first cancellation.
+func (c *Client) SetCanceled(ctx context.Context, rows []int, canceled bool, at time.Time) error {
+	value := ""
+	if canceled {
+		value = at.Format("2006-01-02 15:04:05")
 	}
-	for i, w := range wallets {
-		if w.Name == walletName {
-			return i + 2, w.Balance, nil // +2 because row 1 is header, rows are 1-indexed
-		}
+	data := []*sheets.ValueRange{{
+		Range:  sheetTransactions + "!J1",
+		Values: [][]interface{}{{canceledHeader}},
+	}}
+	for _, r := range rows {
+		data = append(data, &sheets.ValueRange{
+			Range:  fmt.Sprintf("%s!J%d", sheetTransactions, r),
+			Values: [][]interface{}{{value}},
+		})
 	}
-	return -1, 0, fmt.Errorf("wallet %q not found", walletName)
+	if err := c.batchWrite(ctx, data, "RAW"); err != nil {
+		return fmt.Errorf("mark transaction canceled: %w", err)
+	}
+	return nil
 }
 
-// GetLastTransaction returns the most recently appended transaction and its
-// 1-indexed sheet row, or ErrNoTransactions if the sheet is empty.
+// GetLastTransaction returns the most recently appended row, canceled or not,
+// and its 1-indexed sheet row, or ErrNoTransactions if the sheet is empty. It
+// exists for rolling back a just-appended write; /batal uses LastActiveEntry.
 func (c *Client) GetLastTransaction(ctx context.Context) (model.Transaction, int, error) {
-	var resp *sheets.ValueRange
-	err := c.withRecovery(ctx, func() error {
-		var innerErr error
-		resp, innerErr = c.svc.Spreadsheets.Values.Get(c.spreadsheetID, sheetTransactions+"!A2:I").Context(ctx).Do()
-		return innerErr
-	})
+	rows, err := c.readTransactionRows(ctx)
 	if err != nil {
-		return model.Transaction{}, -1, fmt.Errorf("get transactions: %w", err)
+		return model.Transaction{}, -1, err
 	}
-	if len(resp.Values) == 0 {
+	if len(rows) == 0 {
 		return model.Transaction{}, -1, ErrNoTransactions
 	}
 
-	row := resp.Values[len(resp.Values)-1]
-	rowNumber := len(resp.Values) + 1 // data starts at row 2, so last row = count + 1
-
-	tx, err := parseTransactionRow(row)
+	rowNumber := len(rows) + 1 // data starts at row 2, so last row = count + 1
+	tx, err := parseTransactionRow(rows[len(rows)-1])
 	if err != nil {
 		return model.Transaction{}, -1, err
 	}
 	return tx, rowNumber, nil
 }
 
-// GetTransactionsInRange returns all transactions with Date in [from, to).
+// GetTransactionsInRange returns all active (not canceled) transactions with
+// Date in [from, to). Canceled rows are excluded because their effect has
+// already been reversed out of the wallet balances.
 func (c *Client) GetTransactionsInRange(ctx context.Context, from, to time.Time) ([]model.Transaction, error) {
-	var resp *sheets.ValueRange
-	err := c.withRecovery(ctx, func() error {
-		var innerErr error
-		resp, innerErr = c.svc.Spreadsheets.Values.Get(c.spreadsheetID, sheetTransactions+"!A2:I").Context(ctx).Do()
-		return innerErr
-	})
+	rows, err := c.readTransactionRows(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("get transactions: %w", err)
+		return nil, err
 	}
 
 	var result []model.Transaction
-	for _, row := range resp.Values {
+	for _, row := range rows {
 		tx, err := parseTransactionRow(row)
 		if err != nil {
 			continue // skip malformed rows rather than failing the whole recap
+		}
+		if tx.Canceled {
+			continue
 		}
 		if tx.Date.Before(from) || !tx.Date.Before(to) {
 			continue
@@ -291,29 +314,6 @@ func (c *Client) GetTransactionsInRange(ctx context.Context, from, to time.Time)
 		result = append(result, tx)
 	}
 	return result, nil
-}
-
-// GetTransactionRow returns the transaction stored at a specific 1-indexed
-// sheet row, or ErrNoTransactions if that row has no data (e.g. row 1 is the
-// header, or the row is out of range).
-func (c *Client) GetTransactionRow(ctx context.Context, rowNumber int) (model.Transaction, error) {
-	if rowNumber < 2 {
-		return model.Transaction{}, ErrNoTransactions
-	}
-	rangeStr := fmt.Sprintf("%s!A%d:I%d", sheetTransactions, rowNumber, rowNumber)
-	var resp *sheets.ValueRange
-	err := c.withRecovery(ctx, func() error {
-		var innerErr error
-		resp, innerErr = c.svc.Spreadsheets.Values.Get(c.spreadsheetID, rangeStr).Context(ctx).Do()
-		return innerErr
-	})
-	if err != nil {
-		return model.Transaction{}, fmt.Errorf("get transaction row: %w", err)
-	}
-	if len(resp.Values) == 0 {
-		return model.Transaction{}, ErrNoTransactions
-	}
-	return parseTransactionRow(resp.Values[0])
 }
 
 // DeleteTransactionRow removes a single row (1-indexed) from the Transactions sheet.
@@ -384,6 +384,9 @@ func parseTransactionRow(row []interface{}) (model.Transaction, error) {
 	if len(row) >= 9 {
 		direction = model.Direction(fmt.Sprint(row[8]))
 	}
+	// Any non-empty value in column J counts as canceled, so a mark typed by
+	// hand in the sheet is honoured too.
+	canceled := len(row) >= 10 && strings.TrimSpace(fmt.Sprint(row[9])) != ""
 	return model.Transaction{
 		ID:          fmt.Sprint(row[0]),
 		Date:        date,
@@ -394,6 +397,7 @@ func parseTransactionRow(row []interface{}) (model.Transaction, error) {
 		Description: fmt.Sprint(row[6]),
 		RefID:       refID,
 		Direction:   direction,
+		Canceled:    canceled,
 	}, nil
 }
 

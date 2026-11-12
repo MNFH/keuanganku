@@ -38,6 +38,9 @@ type MessageHandler struct {
 	// free-form messages and receipt photos are ignored.
 	parser IntentParser
 
+	// pending holds transactions awaiting the answer to a follow-up question.
+	pending *pendingStore
+
 	// MonthlyReports mirrors whether the scheduler is running, so /help only
 	// promises the automatic report when it will actually arrive.
 	MonthlyReports bool
@@ -53,12 +56,17 @@ type Reply struct {
 	Caption  string
 }
 
-// Message is one inbound WhatsApp message. Image is set for a photo, in which
+// Message is one inbound chat message. Image is set for a photo, in which
 // case Text holds its caption.
 type Message struct {
 	Text      string
 	Image     []byte
 	ImageMIME string
+
+	// SenderID is a stable ID for the person who sent the message, used to
+	// keep a follow-up question in a group chat tied to whoever was asked.
+	// Empty for one-to-one-only transports, where the chat is the person.
+	SenderID string
 }
 
 // New builds a handler. parser may be nil to run with slash commands only.
@@ -68,6 +76,7 @@ func New(users *userstore.Store, credentials string, parser IntentParser) *Messa
 		credentials: credentials,
 		cache:       make(map[string]*sheets.Client),
 		parser:      parser,
+		pending:     newPendingStore(),
 	}
 }
 
@@ -81,6 +90,8 @@ func (h *MessageHandler) Handle(ctx context.Context, chatJID string, msg Message
 	text := strings.TrimSpace(msg.Text)
 
 	if len(msg.Image) == 0 && strings.HasPrefix(text, "/") {
+		// An explicit command supersedes any half-finished conversation.
+		h.pending.clear(pendingKey(chatJID, msg.SenderID))
 		return h.handleCommand(ctx, chatJID, text)
 	}
 	if h.parser == nil || (len(msg.Image) == 0 && text == "") {
@@ -162,19 +173,53 @@ func (h *MessageHandler) handleNaturalLanguage(ctx context.Context, chatJID stri
 		names[i] = w.Name
 	}
 
-	intent, err := h.parser.Parse(ctx, ai.Request{
-		Text:      msg.Text,
-		Image:     msg.Image,
-		ImageMIME: msg.ImageMIME,
-		Wallets:   names,
-		Now:       time.Now(),
-	})
-	if err != nil {
-		log.Printf("natural language: parse: %v", err)
-		if deliberate {
-			return Reply{Text: "❌ Gagal membaca pesan. Coba lagi atau pakai perintah manual (/help)."}
+	key := pendingKey(chatJID, msg.SenderID)
+	draft, hasDraft := h.pending.get(key)
+
+	var intent ai.Intent
+	switch {
+	case hasDraft && !deliberate && isCancel(msg.Text):
+		h.pending.clear(key)
+		return Reply{Text: cancelledDraftMsg}
+
+	case hasDraft && !deliberate:
+		// A bare answer ("flash", "pake gopay", "20rb") completes the draft
+		// without a model round trip; anything richer falls through to the
+		// model, which sees the draft and decides answer-or-new-request.
+		if filled, ok := fillFromAnswer(draft, msg.Text, wallets); ok {
+			intent = filled
+			break
 		}
-		return Reply{}
+		fallthrough
+
+	default:
+		req := ai.Request{
+			Text:      msg.Text,
+			Image:     msg.Image,
+			ImageMIME: msg.ImageMIME,
+			Wallets:   names,
+			Now:       time.Now(),
+		}
+		if hasDraft && !deliberate {
+			req.Pending = &draft
+		}
+		parseCtx, cancel := context.WithTimeout(ctx, parseTimeout)
+		intent, err = h.parser.Parse(parseCtx, req)
+		cancel()
+		if err != nil {
+			log.Printf("natural language: parse: %v", err)
+			if deliberate {
+				return Reply{Text: "❌ Gagal membaca pesan. Coba lagi atau pakai perintah manual (/help)."}
+			}
+			return Reply{}
+		}
+
+		// While a draft is open, "batal" means drop the draft — never undo
+		// a transaction the user didn't just make.
+		if hasDraft && !deliberate && intent.Action == ai.ActionUndo {
+			h.pending.clear(key)
+			return Reply{Text: cancelledDraftMsg}
+		}
 	}
 
 	// With a single wallet there is nothing to disambiguate, so don't make the
@@ -185,15 +230,26 @@ func (h *MessageHandler) handleNaturalLanguage(ctx context.Context, chatJID stri
 
 	command, ok := intent.Command()
 	if !ok {
+		if intent.Mutates() {
+			// A transaction we understood but can't record yet: remember it,
+			// so the answer to the question below completes it.
+			h.pending.set(key, intent)
+			if reply := strings.TrimSpace(intent.Reply); reply != "" {
+				return Reply{Text: "🤖 " + reply}
+			}
+			return Reply{Text: missingDetailMsg(intent, names)}
+		}
 		if reply := strings.TrimSpace(intent.Reply); reply != "" {
 			return Reply{Text: "🤖 " + reply}
 		}
-		if intent.Action == ai.ActionUnknown {
-			// Ordinary conversation — the model deliberately left Reply empty.
-			return Reply{}
-		}
-		return Reply{Text: missingDetailMsg(intent, names)}
+		// Ordinary conversation — the model deliberately left Reply empty.
+		// Any open draft stays open; it expires on its own.
+		return Reply{}
 	}
+
+	// Whatever happens next, the conversation it belonged to is settled: a
+	// completed draft is being recorded, or a new request replaced it.
+	h.pending.clear(key)
 
 	reply := h.handleCommand(ctx, chatJID, command)
 	if reply.Text != "" {
@@ -204,6 +260,16 @@ func (h *MessageHandler) handleNaturalLanguage(ctx context.Context, chatJID stri
 	}
 	return reply
 }
+
+// parseTimeout bounds one natural-language parse, retries included. A model
+// call that hangs on a bad network otherwise holds the whole message timeout
+// (60s), during which that chat's later messages wait in its queue. Giving up
+// sooner lets the user fall back to a slash command quickly.
+const parseTimeout = 20 * time.Second
+
+// cancelledDraftMsg confirms a dropped draft, and points at /batal so nobody
+// thinks it undid an earlier, already-recorded transaction.
+const cancelledDraftMsg = "👌 Oke, tidak jadi dicatat.\n_Untuk membatalkan transaksi terakhir yang sudah tercatat, kirim */batal*_"
 
 // missingDetailMsg explains what a recognised-but-incomplete request still
 // needs, rather than guessing the rest.
@@ -298,13 +364,23 @@ func (h *MessageHandler) cmdDompet(ctx context.Context, sc *sheets.Client, args 
 	switch strings.ToLower(args[0]) {
 	case "tambah", "add":
 		if len(args) < 2 {
-			return "❌ Format: */dompet tambah <nama>*\nContoh: /dompet tambah BCA"
+			return walletAddFormatMsg
 		}
-		name := strings.Join(args[1:], " ")
-		if err := sc.AddWallet(ctx, name); err != nil {
+		name, opening, err := parseWalletAdd(args[1:])
+		if err != nil {
+			return fmt.Sprintf("❌ %v\n\n%s", err, walletAddFormatMsg)
+		}
+		if reply, handled := topUpExistingWallet(ctx, sc, name, opening); handled {
+			return reply
+		}
+		if err := sc.AddWallet(ctx, name, opening); err != nil {
 			return fmt.Sprintf("❌ %v", err)
 		}
-		return fmt.Sprintf("✅ Dompet *%s* berhasil ditambahkan!", name)
+		msg := fmt.Sprintf("✅ Dompet *%s* berhasil ditambahkan!\n\n💰 Saldo awal: Rp %s", name, model.FormatAmount(opening))
+		if opening == 0 {
+			msg += "\n\n_Mau isi saldo awal? Lain kali bisa langsung: /dompet tambah " + name + " 500rb_"
+		}
+		return msg
 	case "list", "daftar":
 		wallets, err := sc.GetWallets(ctx)
 		if err != nil {
@@ -390,14 +466,14 @@ func (h *MessageHandler) cmdTransfer(ctx context.Context, sc *sheets.Client, arg
 		RefID:       refID,
 	}
 	if err := sc.AddTransaction(ctx, inTx); err != nil {
-		// Second leg failed — revert the first so the source wallet isn't left short.
-		if rbErr := sc.AdjustWalletBalance(ctx, from, amount); rbErr != nil {
-			return fmt.Sprintf("❌ Transfer gagal di tengah jalan dan saldo *%s* tidak bisa dikembalikan otomatis. Segera cek manual! Error: %v", from, rbErr)
+		// Second leg failed — remove the first so the source wallet isn't
+		// left short by a transfer that never arrived.
+		if rbErr := sc.RemoveIfLast(ctx, outTx.ID); rbErr != nil {
+			log.Printf("transfer rollback: %v (leg write: %v)", rbErr, err)
+			return fmt.Sprintf("⚠️ Transfer gagal di tengah jalan: baris keluar dari *%s* sudah tercatat tapi baris masuk ke *%s* tidak. Tolong hapus atau batalkan baris itu di sheet (kolom *Canceled At*).", from, to)
 		}
-		if last, rowNum, lerr := sc.GetLastTransaction(ctx); lerr == nil && last.ID == outTx.ID {
-			_ = sc.DeleteTransactionRow(ctx, rowNum)
-		}
-		return fmt.Sprintf("❌ Gagal memproses transfer ke *%s*, saldo *%s* sudah dikembalikan. Error: %v", to, from, err)
+		log.Printf("transfer in-leg: %v", err)
+		return fmt.Sprintf("❌ Gagal memproses transfer ke *%s*. Tidak ada yang tercatat, coba lagi.", to)
 	}
 
 	return fmt.Sprintf("🔄 *Transfer berhasil!*\n\n💸 Dari: %s\n💰 Ke: %s\n💵 Nominal: Rp %s\n📝 Keterangan: %s", from, to, model.FormatAmount(amount), desc)
@@ -648,33 +724,51 @@ func formatCategoryBreakdown(entries []recap.CategoryTotal) string {
 	return b.String()
 }
 
-// /batal — undo the most recently recorded transaction. If the last entry is
-// one leg of a /transfer (linked via RefID), both legs are undone together.
+// /batal — undo the most recent transaction that is still active. If it is one
+// leg of a /transfer (linked via RefID), both legs are undone together.
+//
+// Undo is a soft delete: the row stays in the sheet with column J (Canceled
+// At) filled in, and its effect is reversed out of the wallet balance. Because
+// canceled rows are skipped, sending /batal again undoes the entry before it
+// rather than hitting the same row twice.
 func (h *MessageHandler) cmdBatal(ctx context.Context, sc *sheets.Client) string {
-	tx, rowNumber, err := sc.GetLastTransaction(ctx)
+	entry, err := sc.LastActiveEntry(ctx)
 	if err != nil {
 		if errors.Is(err, sheets.ErrNoTransactions) {
-			return "❌ Belum ada transaksi untuk dibatalkan."
+			return "❌ Tidak ada lagi transaksi yang bisa dibatalkan."
 		}
+		log.Printf("batal: %v", err)
 		return "❌ Gagal mengambil transaksi terakhir."
 	}
 
-	if tx.RefID != "" {
-		pairRow := rowNumber - 1
-		if pair, perr := sc.GetTransactionRow(ctx, pairRow); perr == nil && pair.RefID == tx.RefID {
-			return h.undoTransfer(ctx, sc, tx, rowNumber, pair, pairRow)
-		}
+	// Marking the row(s) canceled is the whole undo: balances are formulas
+	// that skip canceled rows. Both legs of a transfer go in one API call, so
+	// they are canceled together or not at all.
+	rows := make([]int, len(entry))
+	for i, e := range entry {
+		rows[i] = e.Row
+	}
+	if err := sc.SetCanceled(ctx, rows, true, time.Now()); err != nil {
+		log.Printf("batal: %v", err)
+		return "❌ Gagal membatalkan transaksi. Tidak ada yang diubah, coba lagi."
 	}
 
-	return h.undoSingleTransaction(ctx, sc, tx, rowNumber)
+	return undoneMessage(entry)
 }
 
-func (h *MessageHandler) undoSingleTransaction(ctx context.Context, sc *sheets.Client, tx model.Transaction, rowNumber int) string {
-	if err := sc.AdjustWalletBalance(ctx, tx.Wallet, -tx.BalanceDelta()); err != nil {
-		return fmt.Sprintf("❌ Gagal membatalkan transaksi: %v", err)
-	}
-	if err := sc.DeleteTransactionRow(ctx, rowNumber); err != nil {
-		return fmt.Sprintf("❌ Transaksi dibatalkan dari saldo, tapi gagal menghapus baris: %v", err)
+// undoneMessage describes what /batal just canceled.
+func undoneMessage(entry []sheets.TxRow) string {
+	tx := entry[0].Tx
+	when := tx.Date.Format("02/01/2006 15:04")
+	footer := "\n\n_Baris tetap ada di sheet dengan tanda dibatalkan. Kirim */batal* lagi untuk membatalkan transaksi sebelumnya._"
+
+	if tx.Type == model.Transfer && len(entry) == 2 {
+		from, to := entry[1].Tx.Wallet, tx.Wallet
+		if tx.Direction == model.DirectionOut {
+			from, to = tx.Wallet, entry[1].Tx.Wallet
+		}
+		return fmt.Sprintf("↩️ *Transfer dibatalkan!*\n\n💸 Dari: %s\n💰 Ke: %s\n💵 Nominal: Rp %s\n🕐 Tanggal: %s",
+			from, to, model.FormatAmount(tx.Amount), when) + footer
 	}
 
 	label := "💚 Pemasukan"
@@ -683,30 +777,8 @@ func (h *MessageHandler) undoSingleTransaction(ctx context.Context, sc *sheets.C
 	} else if tx.Type == model.Transfer {
 		label = "🔄 Transfer"
 	}
-	return fmt.Sprintf("↩️ *Transaksi terakhir dibatalkan!*\n\n%s: Rp %s\n💳 Dompet: %s\n🏷️ Kategori: %s\n📝 Keterangan: %s", label, model.FormatAmount(tx.Amount), tx.Wallet, tx.Category, tx.Description)
-}
-
-func (h *MessageHandler) undoTransfer(ctx context.Context, sc *sheets.Client, last model.Transaction, lastRow int, pair model.Transaction, pairRow int) string {
-	if err := sc.AdjustWalletBalance(ctx, last.Wallet, -last.BalanceDelta()); err != nil {
-		return fmt.Sprintf("❌ Gagal membatalkan transfer: %v", err)
-	}
-	if err := sc.AdjustWalletBalance(ctx, pair.Wallet, -pair.BalanceDelta()); err != nil {
-		return fmt.Sprintf("❌ Sebagian transfer dibatalkan (saldo *%s* sudah dikembalikan), tapi saldo *%s* gagal dikembalikan: %v. Segera cek manual!", last.Wallet, pair.Wallet, err)
-	}
-
-	// Delete the higher row first (lastRow > pairRow) so the lower row's index doesn't shift.
-	if err := sc.DeleteTransactionRow(ctx, lastRow); err != nil {
-		return fmt.Sprintf("❌ Saldo sudah dikembalikan, tapi gagal menghapus baris transfer: %v", err)
-	}
-	if err := sc.DeleteTransactionRow(ctx, pairRow); err != nil {
-		return fmt.Sprintf("❌ Saldo sudah dikembalikan dan satu baris terhapus, tapi baris satunya gagal dihapus: %v", err)
-	}
-
-	from, to := pair.Wallet, last.Wallet
-	if last.Direction == model.DirectionOut {
-		from, to = last.Wallet, pair.Wallet
-	}
-	return fmt.Sprintf("↩️ *Transfer terakhir dibatalkan!*\n\n💸 Dari: %s\n💰 Ke: %s\n💵 Nominal: Rp %s", from, to, model.FormatAmount(last.Amount))
+	return fmt.Sprintf("↩️ *Transaksi dibatalkan!*\n\n%s: Rp %s\n💳 Dompet: %s\n🏷️ Kategori: %s\n📝 Keterangan: %s\n🕐 Tanggal: %s",
+		label, model.FormatAmount(tx.Amount), tx.Wallet, tx.Category, tx.Description, when) + footer
 }
 
 func (h *MessageHandler) getSheetsClient(chatJID string) (*sheets.Client, error) {
@@ -807,6 +879,110 @@ func addTransaction(ctx context.Context, sc *sheets.Client, txType model.Transac
 	return fmt.Sprintf("🔴 *Pengeluaran* dicatat!\n\n💳 Dompet: %s\n💰 Nominal: Rp %s\n🏷️ Kategori: %s\n📝 Keterangan: %s", matched, model.FormatAmount(amount), category, desc)
 }
 
+// topUpExistingWallet handles "/dompet tambah <nama> <jumlah>" for a wallet
+// that already exists: rather than refusing, it records the amount as an
+// ordinary income (category Lainnya), which is visible in the history and
+// undoable with /batal. It counts as income in /rekap — a deliberate choice
+// over a separate adjustment type, for simplicity.
+//
+// handled is false when the wallet does not exist yet (the caller creates
+// it), and true otherwise, with the reply to send.
+func topUpExistingWallet(ctx context.Context, sc *sheets.Client, name string, amount float64) (reply string, handled bool) {
+	wallets, err := sc.GetWallets(ctx)
+	if err != nil {
+		log.Printf("dompet tambah: %v", err)
+		return "❌ Gagal mengambil data dompet.", true
+	}
+	existing := matchWalletName(wallets, name)
+	if existing == "" {
+		return "", false
+	}
+
+	switch {
+	case amount == 0:
+		return fmt.Sprintf("ℹ️ Dompet *%s* sudah ada.\n\nMau tambah saldonya? Kirim: */dompet tambah %s 500rb*", existing, existing), true
+	case amount < 0:
+		return fmt.Sprintf("❌ Dompet *%s* sudah ada. Untuk mengurangi saldo, catat sebagai pengeluaran: */keluar <jumlah> %s*", existing, existing), true
+	}
+
+	tokens := append(strings.Fields(existing), "Lainnya", "Tambah", "saldo")
+	reply = addTransaction(ctx, sc, model.Income, amount, tokens)
+	if strings.HasPrefix(reply, "❌") {
+		return reply, true
+	}
+	return fmt.Sprintf("ℹ️ Dompet *%s* sudah ada, jadi saldonya ditambahkan sebagai pemasukan.\n\n%s\n\n_Salah? Kirim */batal*_", existing, reply), true
+}
+
+const walletAddFormatMsg ="Format: */dompet tambah <nama> [saldo awal]*\nContoh:\n• /dompet tambah BCA 2jt\n• /dompet tambah Bank Jago Kantong saldo 500rb\n• /dompet tambah GoPay  _(saldo 0)_"
+
+// parseWalletAdd splits "/dompet tambah" arguments into a wallet name and an
+// optional opening balance.
+//
+// The explicit form "<nama> saldo <jumlah>" is always unambiguous. The short
+// form "<nama> <jumlah>" treats the last word as the balance only when it
+// clearly reads as money (see looksLikeMoney), so a wallet called "GoPay 2"
+// or "Tabungan 2025" keeps its full name.
+func parseWalletAdd(tokens []string) (name string, opening float64, err error) {
+	for i, t := range tokens {
+		if strings.EqualFold(t, "saldo") && i > 0 {
+			rest := tokens[i+1:]
+			if len(rest) != 1 {
+				return "", 0, fmt.Errorf("Tulis satu nominal setelah *saldo*.")
+			}
+			opening, err = parseOpening(rest[0])
+			if err != nil {
+				return "", 0, fmt.Errorf("Saldo awal *%s* tidak valid.", rest[0])
+			}
+			return strings.Join(tokens[:i], " "), opening, nil
+		}
+	}
+
+	if n := len(tokens); n >= 2 && looksLikeMoney(tokens[n-1]) {
+		if v, perr := parseOpening(tokens[n-1]); perr == nil {
+			return strings.Join(tokens[:n-1], " "), v, nil
+		}
+	}
+	return strings.Join(tokens, " "), 0, nil
+}
+
+// parseOpening reads an opening balance. Unlike a transaction amount it may
+// be zero, or negative for a credit card or a debt ("-500rb").
+func parseOpening(s string) (float64, error) {
+	t := strings.ToLower(strings.TrimSpace(s))
+	t = strings.TrimPrefix(strings.TrimPrefix(t, "rp."), "rp")
+	neg := strings.HasPrefix(t, "-")
+	t = strings.TrimPrefix(t, "-")
+	if t == "0" {
+		return 0, nil
+	}
+	v, err := parseAmount(t)
+	if err != nil {
+		return 0, err
+	}
+	if neg {
+		v = -v
+	}
+	return v, nil
+}
+
+// looksLikeMoney reports whether a trailing word in the short form is meant as
+// a balance rather than part of the name: it carries a currency marker or
+// shorthand suffix (rp, rb, ribu, k, jt, juta), or is a bare number of at
+// least 10.000 — too large to be a wallet's ordinal or a year.
+func looksLikeMoney(s string) bool {
+	t := strings.ToLower(s)
+	if strings.HasPrefix(t, "rp") {
+		return true
+	}
+	for _, suf := range []string{"rb", "ribu", "k", "jt", "juta"} {
+		if strings.HasSuffix(t, suf) && len(t) > len(suf) && unicode.IsDigit(rune(t[len(t)-len(suf)-1])) {
+			return true
+		}
+	}
+	v, err := strconv.ParseFloat(strings.TrimPrefix(t, "-"), 64)
+	return err == nil && v >= 10000
+}
+
 func listWallets(wallets []model.Wallet) string {
 	if len(wallets) == 0 {
 		return "📭 Belum ada dompet. Tambah dengan: */dompet tambah <nama>*"
@@ -836,7 +1012,9 @@ _Contoh: /masuk 5jt BCA Gaji Gaji bulan ini_
 _Contoh: /keluar 35rb GoPay Makanan Makan siang_
 
 👛 *Dompet:*
-/dompet tambah <nama>  — tambah dompet baru (nama boleh lebih dari satu kata)
+/dompet tambah <nama> [saldo awal]  — tambah dompet baru
+_Contoh: /dompet tambah BCA 2jt_
+_Nama lebih dari satu kata: /dompet tambah Jago Kantong saldo 500rb_
 /dompet list           — lihat semua dompet
 
 🔄 *Transfer:*

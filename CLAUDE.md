@@ -48,8 +48,10 @@ This split is the single most important thing to understand, and the README unde
 by calling Sheets an "optional export":
 
 - **Google Sheets is the transaction database**, one spreadsheet per registered chat, with
-  two tabs created and headed by `sheets.InitSheets`: `Wallets` (Name, Balance, Created At)
-  and `Transactions` (ID, Date, Type, Amount, Wallet, Category, Description, RefID, Direction).
+  two tabs created and headed by `sheets.InitSheets`: `Wallets` (Name, Balance — a formula,
+  Created At, Opening Balance)
+  and `Transactions` (ID, Date, Type, Amount, Wallet, Category, Description, RefID, Direction,
+  Canceled At).
   All reads and writes of financial data go through `internal/sheets`.
 - **MySQL holds only the `users` table** — a `chat ID → spreadsheet_id` mapping, auto-migrated
   on startup by `userstore.New`. The database itself must already exist; only the table is created.
@@ -70,6 +72,14 @@ transports rather than forks.
   talk plain HTTP where possible rather than wrapper libraries.
 - `cmd/api/main.go` holds each event loop, but they all funnel into one `dispatch` function, so
   their behaviour cannot drift apart. Add platform handling there, not in the handler.
+
+**Concurrency: parallel across chats, ordered within one.** Every transport hands messages
+to a `messaging.ChatQueue` keyed by chat ID, so one slow message (a stalled Gemini call, a slow
+photo download) cannot freeze other chats, while a chat's own messages still run in order — the
+follow-up-question flow depends on that. Never call the handler inline from a transport's
+receive loop. AI parsing is capped by `handler.parseTimeout` (20s), inside the 60s
+`messageTimeout`. Telegram network errors pass through `Bot.redact`, because Go's HTTP errors
+embed the request URL and the Bot API puts the token in it.
 
 **Chat ID scheme:** prefixed per platform (`tg:123456`, `wac:628123456789`) except whatsmeow,
 whose IDs stay bare as the JID string they have always been. Prefixing only the newer platforms
@@ -125,6 +135,15 @@ This boundary is the design, not an implementation detail — keep it:
 - Infra errors are surfaced only when the message carried an image (a deliberate act); for
   plain prose they're logged and swallowed, again to avoid group-chat noise.
 
+**Follow-up questions are stateful.** An incomplete expense/income/transfer is kept as a
+draft in `handler/pending.go` (in memory, 10-minute TTL, keyed by chat **and** sender so a
+group member can't complete someone else's draft). The next message first tries
+`fillFromAnswer` — a bare wallet name or amount fills the draft with no model call — and
+otherwise goes to the model with `ai.Request.Pending` set, which decides answer vs. new
+request. While a draft is open, "batal" drops the draft and must never reach `/batal`. The
+prompt keeps incomplete transactions as their real action (not `unknown`) so the draft keeps
+what was already read. Any slash command clears the draft.
+
 Two constraints on generated commands, both covered by `internal/ai/command_test.go`:
 **category must be a single token** (the handler reads one word after the wallet as the category,
 so a two-word category eats the description's first word), and **descriptions are collapsed to
@@ -141,35 +160,46 @@ rather than letting the model invent labels.
 to the same sheet reuse one client. Because of that, `/hapus` only evicts the cache entry after
 `users.AnyUses(spreadsheetID)` confirms no other chat still points at it.
 
-### Wallet balances are denormalized — respect the invariant
+### Wallet balances are spreadsheet formulas — the bot never writes them
 
-`Wallets!B` stores a running balance; it is never recomputed from the transaction history.
-Every write path must keep the pair in sync, and `model.Transaction.BalanceDelta` is the one
-place that decides a transaction's sign. Any undo must apply `-BalanceDelta()` *and* delete
-the row.
+`Wallets!B` is a formula (`sheets.balanceFormula`): `Opening Balance (column D) + income −
+expense + transfers in − transfers out`, summed by `SUMIFS` over the Transactions tab for that
+row's wallet name, skipping rows with a non-empty column J. Recording a transaction is therefore
+a single append, and undo is a single mark — there is no balance write to keep in sync or roll
+back. `model.Transaction.BalanceDelta` and its Go mirror `sheets.formulaDelta` must agree with
+the formula (`TestFormulaDeltaMatchesBalanceDelta`).
 
-There are no transactions across the Sheets API, so multi-step writes roll back by hand.
-`sheets.AddTransaction` is the canonical shape, and its ordering is deliberate:
+- **Migration is automatic and verified.** The first `GetWallets` per client runs
+  `ensureWalletFormulas`: any wallet whose B is a plain number (legacy), empty (just added) or a
+  `#REF!` formula gets one. A legacy balance is preserved by setting D to `balance − formula sum`;
+  the result is read back, and on any mismatch the old numbers are restored. A formula someone
+  wrote by hand is left alone.
+- **Formulas are en_US** (English names, `,` separators): the API parses them that way whatever
+  the spreadsheet locale. Write them with `USER_ENTERED`; write names and data `RAW`.
+- **Read balances with `UNFORMATTED_VALUE`**, and treat a non-numeric cell (`#REF!`, `#NAME?`)
+  as an error — never as 0.
+- **Wallet names are SUMIFS criteria**, so `ValidateWalletName` rejects `* ? ~` and a leading
+  `= < >`. Matching is case-insensitive, like `matchWalletName`.
+- To correct a balance by hand, edit column D, not B.
 
-1. Resolve the wallet row **first** (`findWalletRow`), so an unknown wallet fails before
-   anything is written.
-2. Append the transaction row **before** updating the balance. If the balance write then
-   fails, the sheet is left with a *visible* extra row rather than silent balance drift —
-   the strictly more recoverable failure.
-3. On a balance-write failure, roll the appended row back via `deleteRowIfLastWithID`,
-   which refuses to delete a row that is no longer last (it would belong to another write).
+**`/batal` is a soft delete.** It fills column J (`Canceled At`) instead of deleting the row;
+any non-empty J means canceled. `sheets.LastActiveEntry` skips canceled rows, so repeated
+`/batal` walks back one entry at a time; both legs of a transfer are marked in one batch call.
+Every reader of transaction *history* (`GetTransactionsInRange` → recap, PDF, scheduler) must
+skip canceled rows too.
 
-When rollback itself fails, the returned error wraps **`sheets.ErrInconsistent`**, and
-callers must `errors.Is` it and tell the user to check the sheet by hand instead of
-reporting a plain failure. `cmdTransfer` and `undoTransfer` follow the same manual-rollback
-pattern for their two-leg writes.
+The one remaining multi-step write is `/transfer`'s two appends. If the in leg fails, the out
+leg is hard-deleted with `RemoveIfLast`, which refuses to delete a row that is no longer last
+(it would belong to another write) — that transaction never happened, so it is removed, not
+canceled. `sheets.ErrInconsistent` now only comes from a failed migration rollback; callers
+still `errors.Is` it and tell the user to check the sheet by hand.
 
 ### Transfers are two linked rows
 
 A `/transfer` writes two rows sharing a generated `RefID`: the `out` leg (source wallet) first,
 then the `in` leg. `Direction` disambiguates them, since `Type == Transfer` alone cannot.
-Because the out leg is written first, `/batal` detects a transfer by checking whether the row
-*above* the last one carries the same `RefID`.
+`/batal` finds the other leg as the nearest *active* row above that shares the `RefID`
+(normally the row directly above, since the out leg is written first).
 
 `recap.Compute` **excludes transfers entirely** — moving money between your own wallets is
 neither income nor spending.
@@ -177,8 +207,9 @@ neither income nor spending.
 ### Sheets row-index conventions
 
 Data starts at row 2 because row 1 is the header, so a slice index maps to a sheet row as
-`i + 2` (see `findWalletRow`). When deleting more than one row, delete the **higher index
-first** so the lower one does not shift — `undoTransfer` depends on this.
+`i + 2` (see `ensureWalletFormulas`). If you ever delete more than one row, delete the **higher
+index first** so the lower one does not shift. (Soft delete means `/batal` no longer deletes
+rows, so row numbers stay stable for it.)
 
 `sheets.withRecovery` wraps most value calls: if the API returns the 400 "Unable to parse range"
 error that means a required tab was deleted, it recreates the tabs via `InitSheets` and retries

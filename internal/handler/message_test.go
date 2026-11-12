@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -79,5 +80,49 @@ func TestAmountErrorMsg(t *testing.T) {
 	}
 	if msg := amountErrorMsg("abc", errAmountInvalid); msg == "" || msg == "❌ Nominal harus lebih dari nol: *abc*" {
 		t.Errorf("unexpected message for invalid amount: %q", msg)
+	}
+}
+
+func TestParseWalletAdd(t *testing.T) {
+	tests := []struct {
+		in      string
+		name    string
+		opening float64
+	}{
+		{"BCA", "BCA", 0},
+		{"BCA 2jt", "BCA", 2000000},
+		{"BCA 500rb", "BCA", 500000},
+		{"BCA 200k", "BCA", 200000},
+		{"BCA 50000", "BCA", 50000},
+		{"BCA rp50rb", "BCA", 50000},
+		{"Bank Jago Kantong saldo 500rb", "Bank Jago Kantong", 500000},
+		{"Bank Jago Kantong 1.5jt", "Bank Jago Kantong", 1500000},
+		{"Kartu Kredit saldo -2jt", "Kartu Kredit", -2000000},
+		{"Dompet saldo 0", "Dompet", 0},
+		// A short number is part of the name, not a balance.
+		{"GoPay 2", "GoPay 2", 0},
+		{"Tabungan 2025", "Tabungan 2025", 0},
+		{"Jago 2 saldo 100rb", "Jago 2", 100000},
+		// The keyword only counts after a name, so a wallet can be called "Saldo".
+		{"Saldo", "Saldo", 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			name, opening, err := parseWalletAdd(strings.Fields(tt.in))
+			if err != nil {
+				t.Fatalf("parseWalletAdd(%q) error: %v", tt.in, err)
+			}
+			if name != tt.name || opening != tt.opening {
+				t.Errorf("parseWalletAdd(%q) = (%q, %v), want (%q, %v)", tt.in, name, opening, tt.name, tt.opening)
+			}
+		})
+	}
+}
+
+func TestParseWalletAddRejects(t *testing.T) {
+	for _, in := range []string{"BCA saldo", "BCA saldo abc", "BCA saldo 1 2"} {
+		if _, _, err := parseWalletAdd(strings.Fields(in)); err == nil {
+			t.Errorf("parseWalletAdd(%q) accepted a malformed balance", in)
+		}
 	}
 }

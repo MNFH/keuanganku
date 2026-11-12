@@ -139,6 +139,12 @@ type Request struct {
 
 	// Now anchors relative dates like "kemarin", in the user's local time.
 	Now time.Time
+
+	// Pending is a transaction the bot already asked a follow-up question
+	// about (which wallet, how much) and is still waiting on. When set, the
+	// model is told about it so a reply like "pakai flash" completes the draft
+	// instead of being read as a new, incomplete request. Nil otherwise.
+	Pending *Intent
 }
 
 // Parse classifies one message into an Intent.
@@ -280,6 +286,10 @@ func (p *Parser) userPrompt(req Request) string {
 	fmt.Fprintf(&b, "\nHari ini: %s (%s)\n",
 		req.Now.Format("2006-01-02"), indoWeekday(req.Now))
 
+	if req.Pending != nil {
+		writePending(&b, *req.Pending)
+	}
+
 	if len(req.Image) > 0 {
 		b.WriteString("\nPesan berisi FOTO STRUK/NOTA.")
 		if strings.TrimSpace(req.Text) != "" {
@@ -295,7 +305,28 @@ func (p *Parser) userPrompt(req Request) string {
 	return b.String()
 }
 
-var indoWeekdays = [...]string{"Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"}
+// writePending describes the draft the bot is waiting on, so the model can
+// treat the message as an answer to its own question.
+func writePending(b *strings.Builder, p Intent) {
+	b.WriteString("\nDRAFT TERTUNDA — bot sebelumnya menanyakan detail yang kurang untuk transaksi ini:\n")
+	fmt.Fprintf(b, "- action: %s\n", p.Action)
+	fmt.Fprintf(b, "- amount: %s\n", orMissing(p.Amount > 0, amountArg(p.Amount)))
+	fmt.Fprintf(b, "- wallet: %s\n", orMissing(p.Wallet != "", p.Wallet))
+	if p.Action == ActionTransfer {
+		fmt.Fprintf(b, "- to_wallet: %s\n", orMissing(p.ToWallet != "", p.ToWallet))
+	}
+	fmt.Fprintf(b, "- category: %s\n", orMissing(p.Category != "", p.Category))
+	fmt.Fprintf(b, "- description: %s\n", orMissing(p.Description != "", p.Description))
+}
+
+func orMissing(ok bool, v string) string {
+	if ok {
+		return v
+	}
+	return "(BELUM ADA)"
+}
+
+var indoWeekdays =[...]string{"Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"}
 
 func indoWeekday(t time.Time) string { return indoWeekdays[int(t.Weekday())] }
 
@@ -305,7 +336,7 @@ ACTIONS
 - expense: user spent money. ("beli bakso 20rb gopay", "bayar listrik 300rb bca")
 - income: user received money. ("gajian 5jt bca", "dapet bonus 1jt")
 - transfer: money moved between the user's OWN wallets. Needs both wallet and to_wallet. ("pindah 500rb dari bca ke gopay")
-- add_wallet: user wants a new wallet. Put the name in description. ("tambah dompet Jenius")
+- add_wallet: user wants a new wallet. Put the name in description, and the starting balance, if they give one, in amount (0 otherwise). ("tambah dompet Jenius", "bikin dompet BCA saldonya 2jt" -> description "BCA", amount 2000000)
 - balance: user asks their balance or a summary. ("saldo berapa", "sisa duit")
 - recap: user asks a report for a period. Set period, and want_pdf if they ask for a PDF/file. ("rekap bulan ini", "laporan minggu lalu pdf")
 - undo: user wants to cancel the last entry. ("batal", "salah, hapus")
@@ -335,12 +366,21 @@ Infer the category from what was bought and the kind of merchant: a minimarket o
 If the caption names a wallet or a category, prefer the caption. If the image is not a receipt at all, return unknown.
 
 REPLY RULES
-Leave reply EMPTY for every action except unknown. When you have understood the request, the bot phrases its own confirmation — a reply there is discarded and only confuses the log.
+When the request is complete, leave reply EMPTY — the bot phrases its own confirmation, and a reply there is discarded.
+
+Incomplete expense, income or transfer (no amount, or a wallet you cannot resolve): KEEP the action (expense/income/transfer), fill in every field you did read, use "none" or 0 for what is missing, and set reply to a short Indonesian question asking only for what is missing. Do NOT downgrade it to unknown — the bot remembers the draft and completes it from the user's answer, and an unknown loses what you already read. When you read an amount or a merchant — from a receipt especially — state them in the question ("Total Rp 183.150 dari Toko Berkah Jaya. Pakai dompet apa?") so the user can catch a misread before anything is recorded.
 
 For action = unknown:
 - Ordinary conversation with nothing to do with money ("halo", "oke", "makasih", chit-chat): leave reply EMPTY. The bot will stay silent, which matters because it also sits in group chats.
-- Looks like a finance request but something essential is missing or ambiguous (no amount, or a wallet you cannot resolve): set reply to a short Indonesian question asking only for what is missing. When you already read an amount or a merchant — from a receipt especially — state them in the question ("Total Rp 183.150 dari Toko Berkah Jaya. Pakai dompet apa?") so the user can catch a misread before anything is recorded.
-- Never invent an amount, a wallet, or a transaction you are not confident about. Returning unknown is always better than guessing — a wrong entry silently corrupts the user's ledger.`
+- Looks financial but you cannot even tell which action it is: set reply to a short Indonesian question.
+- Never invent an amount, a wallet, or a transaction you are not confident about. Asking is always better than guessing — a wrong entry silently corrupts the user's ledger.
+
+CONVERSATION (DRAFT TERTUNDA)
+The user prompt may include a DRAFT TERTUNDA: a transaction the bot already asked a question about. Decide whether the new message answers it.
+- If it answers the question ("flash", "pake gopay", "20rb", "dari bca ke jago", "makan siang"): return the draft's action with ALL the draft's known fields kept exactly, plus the newly supplied ones. Do not drop or change fields the user did not mention.
+- If the user cancels the draft ("batal", "gak jadi", "ga usah", "cancel"): return action undo. The bot will discard the draft only — it will not touch any recorded transaction.
+- If it is a new, self-contained request (it carries its own amount and purpose, e.g. "beli kopi 20rb gopay"): ignore the draft and parse the message on its own.
+- If it is unrelated chit-chat: return unknown with an empty reply.`
 
 // responseSchema describes the Intent JSON. Wallet fields are restricted to
 // the user's actual wallets (plus "") so the model cannot invent one.

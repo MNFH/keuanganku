@@ -41,7 +41,13 @@ func (in Intent) Command() (string, bool) {
 		if name == "" {
 			return "", false
 		}
-		return "/dompet tambah " + name, true
+		cmd := "/dompet tambah " + name
+		// The "saldo" keyword marks the opening balance unambiguously, so a
+		// number can never be mistaken for part of the wallet's name.
+		if in.Amount > 0 {
+			cmd += " saldo " + amountArg(in.Amount)
+		}
+		return cmd, true
 
 	case ActionBalance:
 		return "/saldo", true

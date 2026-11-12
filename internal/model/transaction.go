@@ -37,6 +37,10 @@ type Transaction struct {
 	RefID string `json:"ref_id"`
 	// Direction is set only when Type == Transfer (see Direction type above).
 	Direction Direction `json:"direction"`
+	// Canceled marks a soft-deleted transaction: /batal keeps the row for the
+	// record but its effect has been reversed out of the wallet balance, so
+	// it must be ignored by recaps, reports and the next /batal.
+	Canceled bool `json:"canceled"`
 }
 
 // BalanceDelta returns the signed effect this transaction has on tx.Wallet's

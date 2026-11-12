@@ -104,6 +104,11 @@ func TestCommand(t *testing.T) {
 			want:   "/dompet tambah Jenius",
 		},
 		{
+			name:   "add wallet with opening balance",
+			intent: Intent{Action: ActionAddWallet, Description: "Bank Jago 2", Amount: 1500000},
+			want:   "/dompet tambah Bank Jago 2 saldo 1500000",
+		},
+		{
 			name:   "balance",
 			intent: Intent{Action: ActionBalance},
 			want:   "/saldo",

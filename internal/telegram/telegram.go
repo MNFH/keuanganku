@@ -11,11 +11,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/nurfaizh/keuanganku/internal/messaging"
@@ -37,6 +41,9 @@ const (
 type Bot struct {
 	token  string
 	client *http.Client
+
+	mu       sync.RWMutex
+	username string // set by Me; used to recognise "/cmd@ThisBot"
 }
 
 // New builds a Bot. The HTTP client's timeout leaves room for the long poll.
@@ -61,6 +68,9 @@ func (b *Bot) Me(ctx context.Context) (string, error) {
 	if err := json.Unmarshal(raw, &me); err != nil {
 		return "", fmt.Errorf("decode getMe: %w", err)
 	}
+	b.mu.Lock()
+	b.username = me.Username
+	b.mu.Unlock()
 	return me.Username, nil
 }
 
@@ -69,6 +79,9 @@ type Message struct {
 	ChatID int64
 	// From is the sender's username or display name, for logging only.
 	From string
+	// FromID is the sender's stable numeric user ID (0 if unknown), used to
+	// tell group members apart.
+	FromID int64
 	Text string
 	// Photo is the largest available size of an attached photo, already
 	// downloaded. Nil when the message carried no photo.
@@ -82,9 +95,15 @@ type Handler func(ctx context.Context, msg Message)
 // Run long-polls for updates until ctx is cancelled, dispatching each message
 // to handle. Transient failures are logged by the caller's handler; polling
 // itself backs off rather than spinning.
+//
+// Messages are handled through a messaging.ChatQueue: concurrently across
+// chats, in order within one. The poll loop itself never waits on a message,
+// so a slow photo download or a stalled AI call in one chat cannot freeze the
+// bot for every other chat.
 func (b *Bot) Run(ctx context.Context, handle Handler, logf func(string, ...any)) {
 	var offset int64
 	backoff := time.Second
+	queue := messaging.NewChatQueue()
 
 	for {
 		if ctx.Err() != nil {
@@ -124,25 +143,78 @@ func (b *Bot) Run(ctx context.Context, handle Handler, logf func(string, ...any)
 				continue
 			}
 
+			text, forUs := normalizeCommand(msg.text(), b.Username())
+			if !forUs {
+				continue // a command addressed to another bot in the group
+			}
 			out := Message{
 				ChatID: msg.Chat.ID,
 				From:   msg.From.name(),
-				Text:   msg.text(),
+				FromID: msg.From.id(),
+				Text:   text,
 			}
+			fileID := msg.largestPhotoID()
 
-			if fileID := msg.largestPhotoID(); fileID != "" {
-				data, err := b.download(ctx, fileID)
-				if err != nil {
-					logf("telegram: download photo: %v", err)
-					continue
+			queue.Submit(messaging.TelegramChatID(out.ChatID), func() {
+				if fileID != "" {
+					data, err := b.download(ctx, fileID)
+					if err != nil {
+						logf("telegram: download photo: %v", err)
+						return
+					}
+					out.Photo = data
+					out.PhotoMIME = "image/jpeg" // Telegram re-encodes photos as JPEG
 				}
-				out.Photo = data
-				out.PhotoMIME = "image/jpeg" // Telegram re-encodes photos as JPEG
-			}
-
-			handle(ctx, out)
+				handle(ctx, out)
+			})
 		}
 	}
+}
+
+// normalizeCommand strips the "@BotName" Telegram appends to a command picked
+// from the menu in a group ("/dompet@AqsaWallet_bot list" -> "/dompet list"),
+// since the handler matches bare command names.
+//
+// forUs is false when the command names a *different* bot, which happens in
+// a group with several bots; that message is not ours to answer. When our own
+// username is not yet known (getMe failed at startup), any suffix is
+// stripped rather than dropping commands.
+func normalizeCommand(text, username string) (out string, forUs bool) {
+	if !strings.HasPrefix(text, "/") {
+		return text, true
+	}
+	end := strings.IndexAny(text, " \t\n")
+	if end < 0 {
+		end = len(text)
+	}
+	cmd := text[:end]
+	at := strings.IndexByte(cmd, '@')
+	if at < 0 {
+		return text, true
+	}
+	if username != "" && !strings.EqualFold(cmd[at+1:], username) {
+		return text, false
+	}
+	return cmd[:at] + text[end:], true
+}
+
+// Username returns the bot's username once Me has succeeded, or "".
+func (b *Bot) Username() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.username
+}
+
+// redact removes the bot token from a transport error. Go's HTTP client
+// puts the full request URL — which embeds the token — in every network
+// error, and those errors are logged; a token in a log file is a token
+// anyone with log access can use to take over the bot.
+func (b *Bot) redact(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		ue.URL = strings.ReplaceAll(ue.URL, b.token, "<token>")
+	}
+	return err
 }
 
 // SendText delivers a plain reply. The bot's messages are written in
@@ -200,7 +272,7 @@ func (b *Bot) SendDocument(ctx context.Context, chatID string, data []byte, file
 
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("sendDocument: %w", err)
+		return fmt.Errorf("sendDocument: %w", b.redact(err))
 	}
 	defer resp.Body.Close()
 	return decodeResult(resp, nil)
@@ -224,7 +296,7 @@ func (b *Bot) call(ctx context.Context, method string, payload map[string]any) (
 
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", method, err)
+		return nil, fmt.Errorf("%s: %w", method, b.redact(err))
 	}
 	defer resp.Body.Close()
 
@@ -318,7 +390,7 @@ func (b *Bot) download(ctx context.Context, fileID string) ([]byte, error) {
 	}
 	resp, err := b.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch file: %w", err)
+		return nil, fmt.Errorf("fetch file: %w", b.redact(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -348,6 +420,7 @@ type chat struct {
 }
 
 type user struct {
+	ID        int64  `json:"id"`
 	Username  string `json:"username"`
 	FirstName string `json:"first_name"`
 }
@@ -356,6 +429,13 @@ type photoSize struct {
 	FileID   string `json:"file_id"`
 	FileSize int64  `json:"file_size"`
 	Width    int    `json:"width"`
+}
+
+func (u *user) id() int64 {
+	if u == nil {
+		return 0
+	}
+	return u.ID
 }
 
 func (u *user) name() string {

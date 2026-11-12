@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -207,22 +208,28 @@ func startCloud(ctx context.Context, cfg *config.Config, msgHandler *handler.Mes
 }
 
 func cloudHandler(h *handler.MessageHandler, sender messaging.Sender) whatsappcloud.Handler {
+	// The webhook already runs each message on its own goroutine; the queue
+	// adds per-chat ordering, so an answer to a follow-up question is never
+	// handled before the question's own message.
+	queue := messaging.NewChatQueue()
 	return func(ctx context.Context, m whatsappcloud.Message) {
-		ctx, cancel := context.WithTimeout(ctx, messageTimeout)
-		defer cancel()
-
 		chatID := messaging.CloudChatID(m.WaID)
-		if len(m.Image) > 0 {
-			log.Printf("Cloud image in %s from %s (%s, %d bytes), caption: %q",
-				chatID, m.From, m.ImageMIME, len(m.Image), m.Text)
-		} else {
-			log.Printf("Cloud message in %s from %s: %s", chatID, m.From, m.Text)
-		}
+		queue.Submit(chatID, func() {
+			ctx, cancel := context.WithTimeout(ctx, messageTimeout)
+			defer cancel()
 
-		dispatch(ctx, h, sender, chatID, handler.Message{
-			Text:      m.Text,
-			Image:     m.Image,
-			ImageMIME: m.ImageMIME,
+			if len(m.Image) > 0 {
+				log.Printf("Cloud image in %s from %s (%s, %d bytes), caption: %q",
+					chatID, m.From, m.ImageMIME, len(m.Image), m.Text)
+			} else {
+				log.Printf("Cloud message in %s from %s: %s", chatID, m.From, m.Text)
+			}
+
+			dispatch(ctx, h, sender, chatID, handler.Message{
+				Text:      m.Text,
+				Image:     m.Image,
+				ImageMIME: m.ImageMIME,
+			})
 		})
 	}
 }
@@ -264,11 +271,15 @@ func telegramHandler(h *handler.MessageHandler, sender messaging.Sender) telegra
 			log.Printf("Telegram message in %s from %s: %s", chatID, m.From, m.Text)
 		}
 
-		dispatch(ctx, h, sender, chatID, handler.Message{
+		msg := handler.Message{
 			Text:      m.Text,
 			Image:     m.Photo,
 			ImageMIME: m.PhotoMIME,
-		})
+		}
+		if m.FromID != 0 {
+			msg.SenderID = strconv.FormatInt(m.FromID, 10)
+		}
+		dispatch(ctx, h, sender, chatID, msg)
 	}
 }
 
@@ -290,6 +301,7 @@ func startWhatsApp(ctx context.Context, msgHandler *handler.MessageHandler, rout
 	waClient := whatsmeow.NewClient(deviceStore, clientLog)
 	sender := wasend.Sender{Client: waClient}
 	router.WhatsApp = sender
+	waQueue := messaging.NewChatQueue()
 
 	waClient.AddEventHandler(func(evt interface{}) {
 		v, ok := evt.(*events.Message)
@@ -321,28 +333,34 @@ func startWhatsApp(ctx context.Context, msgHandler *handler.MessageHandler, rout
 		}
 
 		chatID := v.Info.Chat.String()
+		senderID := v.Info.Sender.User
 
-		// Natural-language parsing and Sheets calls are network round trips,
-		// so bound them rather than letting one hang this handler.
-		msgCtx, cancel := context.WithTimeout(ctx, messageTimeout)
-		defer cancel()
+		// Hand the work to the per-chat queue and return at once: whatsmeow
+		// delivers events from one loop, so a slow message handled inline
+		// would stall every other chat (see messaging.ChatQueue).
+		waQueue.Submit(chatID, func() {
+			// Natural-language parsing and Sheets calls are network round
+			// trips, so bound them rather than letting one hang the chat.
+			msgCtx, cancel := context.WithTimeout(ctx, messageTimeout)
+			defer cancel()
 
-		msg := handler.Message{Text: text}
-		if img != nil {
-			data, err := waClient.Download(msgCtx, img)
-			if err != nil {
-				log.Printf("download image in %s: %v", chatID, err)
-				return
+			msg := handler.Message{Text: text, SenderID: senderID}
+			if img != nil {
+				data, err := waClient.Download(msgCtx, img)
+				if err != nil {
+					log.Printf("download image in %s: %v", chatID, err)
+					return
+				}
+				msg.Image = data
+				msg.ImageMIME = img.GetMimetype()
+				log.Printf("Image in %s from %s (%s, %d bytes), caption: %q",
+					chatID, senderID, msg.ImageMIME, len(data), text)
+			} else {
+				log.Printf("Message in %s from %s: %s", chatID, senderID, text)
 			}
-			msg.Image = data
-			msg.ImageMIME = img.GetMimetype()
-			log.Printf("Image in %s from %s (%s, %d bytes), caption: %q",
-				chatID, v.Info.Sender.User, msg.ImageMIME, len(data), text)
-		} else {
-			log.Printf("Message in %s from %s: %s", chatID, v.Info.Sender.User, text)
-		}
 
-		dispatch(msgCtx, msgHandler, sender, chatID, msg)
+			dispatch(msgCtx, msgHandler, sender, chatID, msg)
+		})
 	})
 
 	connectWhatsApp(ctx, waClient)
