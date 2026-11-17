@@ -21,10 +21,11 @@ go test ./internal/model -run 'TestFormatAmount/negative_six_digits' -v   # one 
 Tested: `internal/model` (`FormatAmount`, `BalanceDelta`), `internal/handler` (`parseAmount`,
 `lockSheet`), `internal/ai` (`Intent.Command`, `Mutates`, `normalize`), `internal/telegram`
 (`ToHTML`, the per-chat `chatQueues`), `internal/sheets` (`lastActive`, `openingBalance`, the
-balance formula's signs), and
+balance formula's signs), `internal/scheduler` (schedule arithmetic, catch-up, no duplicates,
+retry spacing), and
 `internal/whatsappcloud` (webhook signature verification, the verify handshake, payload
 parsing). Still untested but equally dependency-free: `recap.Compute`, the `*Range` helpers,
-`ParseIndoMonth`, `matchWalletPrefix`, `parseTransactionRow`, `nextFireTime`.
+`ParseIndoMonth`, `matchWalletPrefix`, `parseTransactionRow`.
 
 No test hits a network service, so `ai.Parser.Parse` and every transport's actual I/O are
 uncovered. `cmd/smoke` exercises the live Gemini path by hand (text and `-image`); it needs a
@@ -83,7 +84,7 @@ asymmetry when adding a transport.
 more than 24 hours after the user's last message. `whatsappcloud` surfaces Meta's error 131047
 as `messaging.ErrOutsideWindow`, and implements `messaging.Reengager` to send an approved
 template instead. The scheduler checks for that sentinel and falls back to a nudge rather than
-dropping the monthly report silently. A template **cannot** carry the PDF — only the user
+dropping the scheduled report silently. A template **cannot** carry the PDF — only the user
 making contact reopens the window — so the nudge asks them to reply, and `/rekap` then serves
 the report. Keep the sentinel in `messaging`, not the transport, so callers never import a
 specific platform.
@@ -215,15 +216,26 @@ half-open.
 `internal/recap` is the shared core for both the text `/rekap` reply and the PDF, so period
 logic and Indonesian month parsing/formatting live there and not in the handler.
 `report.GenerateMonthly(title, txs, wallets)` returns raw PDF bytes, used by both the on-demand
-`/rekap ... pdf` path and `internal/scheduler`, which fires on the 1st of each month at 07:00
-local time (`fireDay`/`fireHour`) and sends the previous full month to every registered chat.
+`/rekap ... pdf` path and `internal/scheduler`. The scheduler runs two `Schedule`s, each at
+07:00 local time (`fireHour`): `Monthly` on the 1st for the previous month, `Weekly` on Monday
+for the previous Monday–Sunday week.
 
-**The scheduler is opt-in** (`ENABLE_MONTHLY_REPORT`), and off by default. It is the only thing
-the bot sends unprompted, which on the WhatsApp Cloud API means a billable template
-conversation instead of a free reply inside the 24-hour window. `main.go` also mirrors the flag
-onto `MessageHandler.MonthlyReports` so `/help` only promises the automatic report when it is
-actually running — don't reintroduce that claim unconditionally. Everything the user asks for
-directly, `/rekap ... pdf` included, is unaffected and free.
+**It polls, and remembers what it sent.** Every `checkInterval` (5 min) `runDue` finds each
+schedule's latest fire time and sends that period's report to every chat not yet in the
+`report_deliveries` MySQL table (`SQLDeliveries`, auto-created like `users`). A single long
+timer was lost to restarts and paused by laptop sleep; polling catches up after a wake, and the
+table means a restart never sends a duplicate. A missed report is still sent within the
+schedule's `grace` (weekly 2 days, monthly 5 days), then dropped as stale. A failed delivery
+isn't recorded and is retried at most every `retryInterval` (1 hour). A delivery is recorded
+only after the send succeeds, so the rare failure mode is a duplicate, never a lost report.
+
+**Both schedules are opt-in** (`ENABLE_MONTHLY_REPORT`, `ENABLE_WEEKLY_REPORT`), and off by
+default. They are the only things the bot sends unprompted, which on the WhatsApp Cloud API means
+a billable template conversation instead of a free reply inside the 24-hour window. `main.go`
+mirrors the flags onto `MessageHandler.MonthlyReports` / `WeeklyReports` so `/help` only
+promises automatic reports that are actually running — don't reintroduce that claim
+unconditionally. Everything the user asks for directly, `/rekap ... pdf` included, is
+unaffected and free.
 
 ## Conventions
 

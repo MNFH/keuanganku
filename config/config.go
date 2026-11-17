@@ -60,6 +60,9 @@ type Config struct {
 	// 24-hour service window. Users can still pull a report any time with
 	// /rekap, which is free because it answers their own message.
 	MonthlyReport bool
+	// WeeklyReport turns on the scheduled weekly PDF (Mondays, for the week
+	// before). Opt-in for the same reason as MonthlyReport, four times over.
+	WeeklyReport bool
 }
 
 // AIEnabled reports whether natural-language parsing is configured.
@@ -113,6 +116,7 @@ func Load() *Config {
 		WebhookPath:        getOrDefault("WEBHOOK_PATH", "/webhook"),
 
 		MonthlyReport: isTrue(os.Getenv("ENABLE_MONTHLY_REPORT")),
+		WeeklyReport:  isTrue(os.Getenv("ENABLE_WEEKLY_REPORT")),
 	}
 }
 

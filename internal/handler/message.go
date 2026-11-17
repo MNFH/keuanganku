@@ -48,6 +48,7 @@ type MessageHandler struct {
 	// MonthlyReports mirrors whether the scheduler is running, so /help only
 	// promises the automatic report when it will actually arrive.
 	MonthlyReports bool
+	WeeklyReports  bool
 }
 
 // Reply is what Handle wants sent back. If Document is non-nil it should be
@@ -858,8 +859,13 @@ Tambahkan *pdf* di akhir untuk laporan PDF, contoh: /rekap bulan lalu pdf
 
 	// Only promise the scheduled report when the scheduler is actually
 	// running — it is opt-in, and on some transports it costs money.
-	if h.MonthlyReports {
+	switch {
+	case h.MonthlyReports && h.WeeklyReports:
+		msg += "\n\n_Laporan PDF otomatis: mingguan tiap Senin dan bulanan tiap tanggal 1, jam 07:00._"
+	case h.MonthlyReports:
 		msg += "\n\n_Laporan PDF bulanan otomatis dikirim tiap tanggal 1 jam 07:00._"
+	case h.WeeklyReports:
+		msg += "\n\n_Laporan PDF mingguan otomatis dikirim tiap Senin jam 07:00._"
 	}
 	return msg
 }

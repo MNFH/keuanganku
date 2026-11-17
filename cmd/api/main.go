@@ -132,15 +132,30 @@ func main() {
 			"WHATSAPP_CLOUD_* variables, or leave DISABLE_WHATSAPP unset")
 	}
 
-	// Auto-send a monthly PDF report to every registered chat. Opt-in: it is
-	// the only unprompted message the bot sends, and on the WhatsApp Cloud
-	// API that is a billable template conversation rather than a free reply.
+	// Auto-send PDF reports to every registered chat. Opt-in: they are the
+	// only unprompted messages the bot sends, and on the WhatsApp Cloud API
+	// each is a billable template conversation rather than a free reply.
+	var schedules []scheduler.Schedule
 	if cfg.MonthlyReport {
 		msgHandler.MonthlyReports = true
-		go scheduler.New(users, cfg.GoogleCredentials, router).Run(ctx)
+		schedules = append(schedules, scheduler.Monthly)
 		log.Println("Monthly report scheduler enabled ✓")
 	} else {
 		log.Println("ENABLE_MONTHLY_REPORT not set — monthly reports off; /rekap still works on demand")
+	}
+	if cfg.WeeklyReport {
+		msgHandler.WeeklyReports = true
+		schedules = append(schedules, scheduler.Weekly)
+		log.Println("Weekly report scheduler enabled ✓")
+	} else {
+		log.Println("ENABLE_WEEKLY_REPORT not set — weekly reports off; /rekap still works on demand")
+	}
+	if len(schedules) > 0 {
+		deliveries, err := scheduler.NewSQLDeliveries(db)
+		if err != nil {
+			log.Fatalf("Init report delivery log: %v", err)
+		}
+		go scheduler.New(users, deliveries, cfg.GoogleCredentials, router, schedules...).Run(ctx)
 	}
 
 	// Wait for signal
