@@ -34,6 +34,13 @@ type MessageHandler struct {
 	cache       map[string]*sheets.Client
 	cacheMu     sync.RWMutex
 
+	// sheetLocks serializes commands per spreadsheet. Writes are
+	// read-modify-write on the wallet balance and roll back by checking that
+	// their row is still last, so two concurrent writes to one sheet — from
+	// the same chat, or from two chats sharing it — would corrupt balances.
+	sheetLocks   map[string]*sync.Mutex
+	sheetLocksMu sync.Mutex
+
 	// parser is nil when no AI credentials are configured, in which case
 	// free-form messages and receipt photos are ignored.
 	parser IntentParser
@@ -67,6 +74,7 @@ func New(users *userstore.Store, credentials string, parser IntentParser) *Messa
 		users:       users,
 		credentials: credentials,
 		cache:       make(map[string]*sheets.Client),
+		sheetLocks:  make(map[string]*sync.Mutex),
 		parser:      parser,
 	}
 }
@@ -96,6 +104,9 @@ func (h *MessageHandler) handleCommand(ctx context.Context, senderJID, text stri
 
 	// Registration command — no sheet needed
 	if cmd == "/daftar" {
+		if len(args) > 0 {
+			defer h.lockSheet(args[0])()
+		}
 		return Reply{Text: h.cmdDaftar(ctx, senderJID, args)}
 	}
 	if cmd == "/help" || cmd == "/bantuan" {
@@ -103,9 +114,17 @@ func (h *MessageHandler) handleCommand(ctx context.Context, senderJID, text stri
 	}
 
 	// All other commands require a registered sheet
+	if user, ok := h.users.Get(senderJID); ok {
+		defer h.lockSheet(user.SpreadsheetID)()
+	}
 	sheetsClient, err := h.getSheetsClient(senderJID)
 	if err != nil {
 		return Reply{Text: "❌ Kamu belum terdaftar. Kirim:\n*/daftar <spreadsheet_id>*\n\nCara dapat ID: buka Google Sheet kamu, salin ID dari URL-nya."}
+	}
+	// Must succeed before anything is written; see EnsureBalanceFormulas.
+	if err := sheetsClient.EnsureBalanceFormulas(ctx); err != nil {
+		log.Printf("ensure balance formulas for %s: %v", senderJID, err)
+		return Reply{Text: "❌ Gagal menyiapkan spreadsheet. Coba lagi sebentar."}
 	}
 
 	switch cmd {
@@ -234,6 +253,10 @@ func (h *MessageHandler) cmdDaftar(ctx context.Context, senderJID string, args [
 	}
 	if err := client.InitSheets(ctx); err != nil {
 		return fmt.Sprintf("❌ Tidak bisa mengakses spreadsheet.\n\nPastikan kamu sudah share sheet ke:\n*keuanganku@keuanganku-504009.iam.gserviceaccount.com*\ndengan akses *Editor*.\n\nError: %v", err)
+	}
+	if err := client.EnsureBalanceFormulas(ctx); err != nil {
+		log.Printf("ensure balance formulas for %s: %v", spreadsheetID, err)
+		return "❌ Gagal menyiapkan rumus saldo di spreadsheet. Coba lagi."
 	}
 
 	if err := h.users.Set(senderJID, userstore.User{SpreadsheetID: spreadsheetID}); err != nil {
@@ -371,13 +394,6 @@ func (h *MessageHandler) cmdTransfer(ctx context.Context, sc *sheets.Client, arg
 		Date:        now,
 		RefID:       refID,
 	}
-	if err := sc.AddTransaction(ctx, outTx); err != nil {
-		if errors.Is(err, sheets.ErrInconsistent) {
-			return fmt.Sprintf("❌ Transfer gagal dan spreadsheet perlu diperiksa manual. Error: %v", err)
-		}
-		return fmt.Sprintf("❌ Gagal memproses transfer: %v", err)
-	}
-
 	inTx := model.Transaction{
 		ID:          uuid.New().String(),
 		Type:        model.Transfer,
@@ -389,15 +405,9 @@ func (h *MessageHandler) cmdTransfer(ctx context.Context, sc *sheets.Client, arg
 		Date:        now,
 		RefID:       refID,
 	}
-	if err := sc.AddTransaction(ctx, inTx); err != nil {
-		// Second leg failed — revert the first so the source wallet isn't left short.
-		if rbErr := sc.AdjustWalletBalance(ctx, from, amount); rbErr != nil {
-			return fmt.Sprintf("❌ Transfer gagal di tengah jalan dan saldo *%s* tidak bisa dikembalikan otomatis. Segera cek manual! Error: %v", from, rbErr)
-		}
-		if last, rowNum, lerr := sc.GetLastTransaction(ctx); lerr == nil && last.ID == outTx.ID {
-			_ = sc.DeleteTransactionRow(ctx, rowNum)
-		}
-		return fmt.Sprintf("❌ Gagal memproses transfer ke *%s*, saldo *%s* sudah dikembalikan. Error: %v", to, from, err)
+	// Both legs in one append: they land together or not at all.
+	if err := sc.AddTransactions(ctx, outTx, inTx); err != nil {
+		return fmt.Sprintf("❌ Gagal memproses transfer: %v", err)
 	}
 
 	return fmt.Sprintf("🔄 *Transfer berhasil!*\n\n💸 Dari: %s\n💰 Ke: %s\n💵 Nominal: Rp %s\n📝 Keterangan: %s", from, to, model.FormatAmount(amount), desc)
@@ -648,33 +658,26 @@ func formatCategoryBreakdown(entries []recap.CategoryTotal) string {
 	return b.String()
 }
 
-// /batal — undo the most recently recorded transaction. If the last entry is
-// one leg of a /transfer (linked via RefID), both legs are undone together.
+// /batal — undo the most recently recorded transaction by marking it cancelled
+// in the sheet (the row stays as history). If it is one leg of a /transfer
+// (linked via RefID), both legs are cancelled together.
 func (h *MessageHandler) cmdBatal(ctx context.Context, sc *sheets.Client) string {
-	tx, rowNumber, err := sc.GetLastTransaction(ctx)
+	cancelled, err := sc.CancelLast(ctx, "batal "+time.Now().Format("2006-01-02 15:04:05"))
 	if err != nil {
 		if errors.Is(err, sheets.ErrNoTransactions) {
 			return "❌ Belum ada transaksi untuk dibatalkan."
 		}
-		return "❌ Gagal mengambil transaksi terakhir."
+		log.Printf("cancel last transaction: %v", err)
+		return "❌ Gagal membatalkan transaksi terakhir."
 	}
 
-	if tx.RefID != "" {
-		pairRow := rowNumber - 1
-		if pair, perr := sc.GetTransactionRow(ctx, pairRow); perr == nil && pair.RefID == tx.RefID {
-			return h.undoTransfer(ctx, sc, tx, rowNumber, pair, pairRow)
+	tx := cancelled[0]
+	if len(cancelled) == 2 {
+		from, to := cancelled[1].Wallet, tx.Wallet
+		if tx.Direction == model.DirectionOut {
+			from, to = tx.Wallet, cancelled[1].Wallet
 		}
-	}
-
-	return h.undoSingleTransaction(ctx, sc, tx, rowNumber)
-}
-
-func (h *MessageHandler) undoSingleTransaction(ctx context.Context, sc *sheets.Client, tx model.Transaction, rowNumber int) string {
-	if err := sc.AdjustWalletBalance(ctx, tx.Wallet, -tx.BalanceDelta()); err != nil {
-		return fmt.Sprintf("❌ Gagal membatalkan transaksi: %v", err)
-	}
-	if err := sc.DeleteTransactionRow(ctx, rowNumber); err != nil {
-		return fmt.Sprintf("❌ Transaksi dibatalkan dari saldo, tapi gagal menghapus baris: %v", err)
+		return fmt.Sprintf("↩️ *Transfer terakhir dibatalkan!*\n\n💸 Dari: %s\n💰 Ke: %s\n💵 Nominal: Rp %s", from, to, model.FormatAmount(tx.Amount))
 	}
 
 	label := "💚 Pemasukan"
@@ -686,27 +689,19 @@ func (h *MessageHandler) undoSingleTransaction(ctx context.Context, sc *sheets.C
 	return fmt.Sprintf("↩️ *Transaksi terakhir dibatalkan!*\n\n%s: Rp %s\n💳 Dompet: %s\n🏷️ Kategori: %s\n📝 Keterangan: %s", label, model.FormatAmount(tx.Amount), tx.Wallet, tx.Category, tx.Description)
 }
 
-func (h *MessageHandler) undoTransfer(ctx context.Context, sc *sheets.Client, last model.Transaction, lastRow int, pair model.Transaction, pairRow int) string {
-	if err := sc.AdjustWalletBalance(ctx, last.Wallet, -last.BalanceDelta()); err != nil {
-		return fmt.Sprintf("❌ Gagal membatalkan transfer: %v", err)
+// lockSheet blocks until no other command is running against spreadsheetID,
+// and returns the matching unlock.
+func (h *MessageHandler) lockSheet(spreadsheetID string) (unlock func()) {
+	h.sheetLocksMu.Lock()
+	mu, ok := h.sheetLocks[spreadsheetID]
+	if !ok {
+		mu = &sync.Mutex{}
+		h.sheetLocks[spreadsheetID] = mu
 	}
-	if err := sc.AdjustWalletBalance(ctx, pair.Wallet, -pair.BalanceDelta()); err != nil {
-		return fmt.Sprintf("❌ Sebagian transfer dibatalkan (saldo *%s* sudah dikembalikan), tapi saldo *%s* gagal dikembalikan: %v. Segera cek manual!", last.Wallet, pair.Wallet, err)
-	}
+	h.sheetLocksMu.Unlock()
 
-	// Delete the higher row first (lastRow > pairRow) so the lower row's index doesn't shift.
-	if err := sc.DeleteTransactionRow(ctx, lastRow); err != nil {
-		return fmt.Sprintf("❌ Saldo sudah dikembalikan, tapi gagal menghapus baris transfer: %v", err)
-	}
-	if err := sc.DeleteTransactionRow(ctx, pairRow); err != nil {
-		return fmt.Sprintf("❌ Saldo sudah dikembalikan dan satu baris terhapus, tapi baris satunya gagal dihapus: %v", err)
-	}
-
-	from, to := pair.Wallet, last.Wallet
-	if last.Direction == model.DirectionOut {
-		from, to = last.Wallet, pair.Wallet
-	}
-	return fmt.Sprintf("↩️ *Transfer terakhir dibatalkan!*\n\n💸 Dari: %s\n💰 Ke: %s\n💵 Nominal: Rp %s", from, to, model.FormatAmount(last.Amount))
+	mu.Lock()
+	return mu.Unlock
 }
 
 func (h *MessageHandler) getSheetsClient(chatJID string) (*sheets.Client, error) {
@@ -794,10 +789,7 @@ func addTransaction(ctx context.Context, sc *sheets.Client, txType model.Transac
 		Date:        time.Now(),
 	}
 
-	if err := sc.AddTransaction(ctx, tx); err != nil {
-		if errors.Is(err, sheets.ErrInconsistent) {
-			return fmt.Sprintf("❌ Transaksi gagal disimpan dan spreadsheet perlu diperiksa manual. Error: %v", err)
-		}
+	if err := sc.AddTransactions(ctx, tx); err != nil {
 		return fmt.Sprintf("❌ Gagal menyimpan transaksi: %v", err)
 	}
 

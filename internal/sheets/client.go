@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/nurfaizh/keuanganku/internal/model"
 	"google.golang.org/api/googleapi"
@@ -17,20 +20,39 @@ import (
 const (
 	sheetWallets      = "Wallets"
 	sheetTransactions = "Transactions"
+
+	dateLayout = "2006-01-02 15:04:05"
 )
+
+// balanceFormula is what Wallets!B holds: the row's Opening Balance (D) plus
+// every transaction on that wallet whose Cancelled column (Transactions!J) is
+// empty. It finds its own row with ROW(), so the same text is correct on
+// whichever row an append lands on.
+//
+// It must agree with model.Transaction.BalanceDelta, which EnsureBalanceFormulas
+// uses to back out an opening balance.
+const balanceFormula = `=INDEX($D:$D,ROW())` +
+	`+SUMIFS(Transactions!$D:$D,Transactions!$E:$E,INDEX($A:$A,ROW()),Transactions!$C:$C,"income",Transactions!$J:$J,"")` +
+	`-SUMIFS(Transactions!$D:$D,Transactions!$E:$E,INDEX($A:$A,ROW()),Transactions!$C:$C,"expense",Transactions!$J:$J,"")` +
+	`+SUMIFS(Transactions!$D:$D,Transactions!$E:$E,INDEX($A:$A,ROW()),Transactions!$C:$C,"transfer",Transactions!$I:$I,"in",Transactions!$J:$J,"")` +
+	`-SUMIFS(Transactions!$D:$D,Transactions!$E:$E,INDEX($A:$A,ROW()),Transactions!$C:$C,"transfer",Transactions!$I:$I,"out",Transactions!$J:$J,"")`
 
 // ErrNoTransactions is returned when there is nothing to undo.
 var ErrNoTransactions = errors.New("no transactions found")
 
-// ErrInconsistent is wrapped into errors returned when a multi-step write
-// failed partway and could not be rolled back, so wallet balances and
-// transaction rows no longer agree and the sheet needs manual review.
-// Callers must surface this to the user rather than reporting a plain failure.
-var ErrInconsistent = errors.New("spreadsheet left inconsistent")
-
+// Client reads and writes one spreadsheet.
+//
+// Financial data is append-only. A transaction is only ever added; undoing
+// one marks its Cancelled column instead of deleting it; and a wallet's
+// balance is a formula over the Transactions tab that the bot reads but never
+// writes. Every write is therefore a single API call — nothing to roll back,
+// and two chats writing at once cannot lose each other's update.
 type Client struct {
 	svc           *sheets.Service
 	spreadsheetID string
+
+	formulasMu      sync.Mutex
+	formulasChecked bool
 }
 
 func New(credentialsFile, spreadsheetID string) (*Client, error) {
@@ -43,7 +65,7 @@ func New(credentialsFile, spreadsheetID string) (*Client, error) {
 }
 
 func (c *Client) InitSheets(ctx context.Context) error {
-	resp, err := c.svc.Spreadsheets.Get(c.spreadsheetID).Do()
+	resp, err := c.svc.Spreadsheets.Get(c.spreadsheetID).Context(ctx).Do()
 	if err != nil {
 		return fmt.Errorf("get spreadsheet: %w", err)
 	}
@@ -73,19 +95,154 @@ func (c *Client) InitSheets(ctx context.Context) error {
 		}
 	}
 
-	// Write headers if sheets were just created
+	// Write headers if sheets were just created — in one call, since a fresh
+	// registration needs both and each round trip is a second or so.
+	var headers []*sheets.ValueRange
 	if !existing[sheetWallets] {
-		if err := c.writeRow(ctx, sheetWallets+"!A1", []interface{}{"Name", "Balance", "Created At"}); err != nil {
-			return err
-		}
+		headers = append(headers, headerRange(sheetWallets, "Name", "Balance", "Created At", "Opening Balance"))
 	}
 	if !existing[sheetTransactions] {
-		if err := c.writeRow(ctx, sheetTransactions+"!A1", []interface{}{"ID", "Date", "Type", "Amount", "Wallet", "Category", "Description", "RefID", "Direction"}); err != nil {
-			return err
+		headers = append(headers, headerRange(sheetTransactions, "ID", "Date", "Type", "Amount", "Wallet", "Category", "Description", "RefID", "Direction", "Cancelled"))
+	}
+	if len(headers) > 0 {
+		_, err = c.svc.Spreadsheets.Values.BatchUpdate(c.spreadsheetID, &sheets.BatchUpdateValuesRequest{
+			ValueInputOption: "RAW",
+			Data:             headers,
+		}).Context(ctx).Do()
+		if err != nil {
+			return fmt.Errorf("write headers: %w", err)
 		}
 	}
 
 	return nil
+}
+
+func headerRange(sheet string, columns ...interface{}) *sheets.ValueRange {
+	return &sheets.ValueRange{Range: sheet + "!A1", Values: [][]interface{}{columns}}
+}
+
+// EnsureBalanceFormulas converts every wallet whose Balance is a typed number
+// — a sheet from before balances were formulas, or one overwritten by hand —
+// to balanceFormula. It sets Opening Balance to the typed balance minus the
+// wallet's active transactions, so the formula shows exactly what the row
+// showed before. Wallets that already have a formula, including ones the user
+// wrote, are left alone.
+//
+// It does the work once per Client. Callers must hold the sheet's lock and
+// must not write transactions if it fails: a transaction recorded against a
+// still-typed balance would be counted into the opening balance and vanish.
+func (c *Client) EnsureBalanceFormulas(ctx context.Context) error {
+	c.formulasMu.Lock()
+	defer c.formulasMu.Unlock()
+	if c.formulasChecked {
+		return nil
+	}
+
+	resp, err := c.svc.Spreadsheets.Get(c.spreadsheetID).
+		Ranges(sheetWallets + "!A1:D").
+		IncludeGridData(true).
+		Fields("sheets.data.rowData.values.userEnteredValue").
+		Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("read wallet formulas: %w", err)
+	}
+	var rows []*sheets.RowData
+	if len(resp.Sheets) > 0 && len(resp.Sheets[0].Data) > 0 {
+		rows = resp.Sheets[0].Data[0].RowData
+	}
+
+	var updates []*sheets.ValueRange
+	var txs []entry
+	txsLoaded := false
+	for i, rd := range rows {
+		if i == 0 {
+			continue // header
+		}
+		name := cellText(rd, 1)
+		if name == "" {
+			continue
+		}
+		balance := cellValue(rd, 2)
+		if balance != nil && balance.FormulaValue != nil {
+			continue
+		}
+
+		if !txsLoaded {
+			if txs, err = c.readTransactions(ctx); err != nil {
+				return err
+			}
+			txsLoaded = true
+		}
+		row := i + 1
+		updates = append(updates,
+			&sheets.ValueRange{Range: fmt.Sprintf("%s!B%d", sheetWallets, row), Values: [][]interface{}{{balanceFormula}}},
+			&sheets.ValueRange{Range: fmt.Sprintf("%s!D%d", sheetWallets, row), Values: [][]interface{}{{openingBalance(typedNumber(balance), name, txs)}}},
+		)
+	}
+
+	if len(updates) > 0 {
+		if len(rows) > 0 && cellText(rows[0], 4) == "" {
+			updates = append(updates, &sheets.ValueRange{Range: sheetWallets + "!D1", Values: [][]interface{}{{"Opening Balance"}}})
+		}
+		_, err = c.svc.Spreadsheets.Values.BatchUpdate(c.spreadsheetID, &sheets.BatchUpdateValuesRequest{
+			ValueInputOption: "USER_ENTERED",
+			Data:             updates,
+		}).Context(ctx).Do()
+		if err != nil {
+			return fmt.Errorf("write balance formulas: %w", err)
+		}
+	}
+
+	c.formulasChecked = true
+	return nil
+}
+
+// openingBalance is the Opening Balance that makes balanceFormula reproduce
+// balance: balance minus the wallet's active transactions. The wallet match is
+// case-insensitive, like SUMIFS.
+func openingBalance(balance float64, wallet string, txs []entry) float64 {
+	for _, e := range txs {
+		if !e.cancelled && strings.EqualFold(e.tx.Wallet, wallet) {
+			balance -= e.tx.BalanceDelta()
+		}
+	}
+	return balance
+}
+
+// cellValue returns the user-entered value of the 1-indexed column col, or nil.
+func cellValue(rd *sheets.RowData, col int) *sheets.ExtendedValue {
+	if rd == nil || len(rd.Values) < col || rd.Values[col-1] == nil {
+		return nil
+	}
+	return rd.Values[col-1].UserEnteredValue
+}
+
+func cellText(rd *sheets.RowData, col int) string {
+	v := cellValue(rd, col)
+	switch {
+	case v == nil:
+		return ""
+	case v.StringValue != nil:
+		return strings.TrimSpace(*v.StringValue)
+	case v.NumberValue != nil:
+		return strconv.FormatFloat(*v.NumberValue, 'f', -1, 64)
+	}
+	return ""
+}
+
+// typedNumber reads a typed (non-formula) balance cell; blank counts as 0.
+func typedNumber(v *sheets.ExtendedValue) float64 {
+	if v == nil {
+		return 0
+	}
+	if v.NumberValue != nil {
+		return *v.NumberValue
+	}
+	if v.StringValue != nil {
+		n, _ := strconv.ParseFloat(strings.TrimSpace(*v.StringValue), 64)
+		return n
+	}
+	return 0
 }
 
 // isMissingSheetError reports whether err is the Sheets API's "Unable to
@@ -112,11 +269,15 @@ func (c *Client) withRecovery(ctx context.Context, fn func() error) error {
 	return fn()
 }
 
+// GetWallets returns every wallet with its balance as the sheet computes it.
 func (c *Client) GetWallets(ctx context.Context) ([]model.Wallet, error) {
 	var resp *sheets.ValueRange
 	err := c.withRecovery(ctx, func() error {
 		var innerErr error
-		resp, innerErr = c.svc.Spreadsheets.Values.Get(c.spreadsheetID, sheetWallets+"!A2:B").Context(ctx).Do()
+		// Unformatted, so a currency format on the Balance column still
+		// parses as a number.
+		resp, innerErr = c.svc.Spreadsheets.Values.Get(c.spreadsheetID, sheetWallets+"!A2:B").
+			ValueRenderOption("UNFORMATTED_VALUE").Context(ctx).Do()
 		return innerErr
 	})
 	if err != nil {
@@ -125,10 +286,13 @@ func (c *Client) GetWallets(ctx context.Context) ([]model.Wallet, error) {
 
 	var wallets []model.Wallet
 	for _, row := range resp.Values {
-		if len(row) < 2 {
+		if len(row) < 1 || fmt.Sprint(row[0]) == "" {
 			continue
 		}
-		balance, _ := strconv.ParseFloat(fmt.Sprint(row[1]), 64)
+		var balance float64
+		if len(row) >= 2 {
+			balance, _ = strconv.ParseFloat(fmt.Sprint(row[1]), 64)
+		}
 		wallets = append(wallets, model.Wallet{
 			Name:    fmt.Sprint(row[0]),
 			Balance: balance,
@@ -137,230 +301,184 @@ func (c *Client) GetWallets(ctx context.Context) ([]model.Wallet, error) {
 	return wallets, nil
 }
 
+// AddWallet appends a wallet with an opening balance of 0 and the balance
+// formula, in one write.
 func (c *Client) AddWallet(ctx context.Context, name string) error {
+	if err := validWalletName(name); err != nil {
+		return err
+	}
 	wallets, err := c.GetWallets(ctx)
 	if err != nil {
 		return err
 	}
 	for _, w := range wallets {
-		if w.Name == name {
-			return fmt.Errorf("wallet %q already exists", name)
+		if strings.EqualFold(w.Name, name) {
+			return fmt.Errorf("wallet %q already exists", w.Name)
 		}
 	}
-	return c.appendRow(ctx, sheetWallets+"!A:C", []interface{}{name, 0, time.Now().Format("2006-01-02 15:04:05")})
-}
-
-// AddTransaction records tx: it appends the transaction row, then applies the
-// transaction's effect to its wallet's balance.
-//
-// The wallet row is resolved before anything is written, so an unknown wallet
-// fails without leaving a partial write behind. Sheets has no multi-write
-// transaction, so the row is appended *before* the balance is updated: if the
-// balance write then fails, the sheet is left with a visible transaction row
-// rather than silent balance drift, and that row is rolled back when possible.
-// An error wrapping ErrInconsistent means the rollback itself failed.
-func (c *Client) AddTransaction(ctx context.Context, tx model.Transaction) error {
-	row, balance, err := c.findWalletRow(ctx, tx.Wallet)
-	if err != nil {
-		return err
-	}
-
-	if err := c.appendRow(ctx, sheetTransactions+"!A:I", []interface{}{
-		tx.ID,
-		tx.Date.Format("2006-01-02 15:04:05"),
-		string(tx.Type),
-		tx.Amount,
-		tx.Wallet,
-		tx.Category,
-		tx.Description,
-		tx.RefID,
-		string(tx.Direction),
-	}); err != nil {
-		return err
-	}
-
-	if err := c.setWalletBalance(ctx, row, balance+tx.BalanceDelta()); err != nil {
-		if rbErr := c.deleteRowIfLastWithID(ctx, tx.ID); rbErr != nil {
-			return fmt.Errorf("%w: %v; transaction row could not be removed: %v", ErrInconsistent, err, rbErr)
-		}
-		return err
-	}
-	return nil
-}
-
-// deleteRowIfLastWithID removes the final transaction row if it still carries
-// the given ID, rolling back an append whose follow-up write failed. It
-// refuses to delete a row that is no longer the last one, since that row
-// belongs to some other write.
-func (c *Client) deleteRowIfLastWithID(ctx context.Context, id string) error {
-	last, rowNumber, err := c.GetLastTransaction(ctx)
-	if err != nil {
-		return fmt.Errorf("locate appended row: %w", err)
-	}
-	if last.ID != id {
-		return fmt.Errorf("appended row is no longer the last row")
-	}
-	return c.DeleteTransactionRow(ctx, rowNumber)
-}
-
-// AdjustWalletBalance adds delta (positive or negative) to a wallet's balance.
-func (c *Client) AdjustWalletBalance(ctx context.Context, walletName string, delta float64) error {
-	row, currentBalance, err := c.findWalletRow(ctx, walletName)
-	if err != nil {
-		return err
-	}
-	return c.setWalletBalance(ctx, row, currentBalance+delta)
-}
-
-// setWalletBalance writes an absolute balance to a wallet's 1-indexed sheet row.
-func (c *Client) setWalletBalance(ctx context.Context, row int, balance float64) error {
-	balanceRange := fmt.Sprintf("%s!B%d", sheetWallets, row)
-	err := c.withRecovery(ctx, func() error {
-		_, innerErr := c.svc.Spreadsheets.Values.Update(c.spreadsheetID, balanceRange,
-			&sheets.ValueRange{Values: [][]interface{}{{balance}}}).
-			ValueInputOption("RAW").Context(ctx).Do()
-		return innerErr
+	// USER_ENTERED so the formula is evaluated; the leading apostrophes keep
+	// the name and timestamp as literal text rather than letting Sheets parse
+	// them (a name starting with "=" would otherwise become a formula).
+	return c.appendRows(ctx, sheetWallets+"!A:D", "USER_ENTERED", [][]interface{}{
+		{"'" + name, balanceFormula, "'" + time.Now().Format(dateLayout), 0},
 	})
-	if err != nil {
-		return fmt.Errorf("update wallet balance: %w", err)
+}
+
+// validWalletName rejects names balanceFormula cannot match. SUMIFS reads its
+// criterion as a pattern: a leading = < > makes it a comparison, and * ? ~
+// are wildcards anywhere, so such a wallet would never count its own
+// transactions. Requiring a letter or digit first rules out every operator
+// at once; real wallet names (bank, e-wallet) never start with a symbol.
+func validWalletName(name string) error {
+	first, _ := utf8.DecodeRuneInString(name)
+	if name == "" || !(unicode.IsLetter(first) || unicode.IsDigit(first)) || strings.ContainsAny(name, "*?~") {
+		return fmt.Errorf("nama dompet harus diawali huruf atau angka, dan tidak boleh berisi * ? ~")
 	}
 	return nil
 }
 
-// findWalletRow returns the 1-indexed sheet row and current balance of a wallet.
-func (c *Client) findWalletRow(ctx context.Context, walletName string) (row int, balance float64, err error) {
+// AddTransactions records txs in a single append, so the two legs of a
+// transfer land together or not at all. Every wallet must already exist; the
+// check comes first so an unknown wallet writes nothing.
+func (c *Client) AddTransactions(ctx context.Context, txs ...model.Transaction) error {
 	wallets, err := c.GetWallets(ctx)
 	if err != nil {
-		return -1, 0, err
+		return err
 	}
-	for i, w := range wallets {
-		if w.Name == walletName {
-			return i + 2, w.Balance, nil // +2 because row 1 is header, rows are 1-indexed
+	rows := make([][]interface{}, 0, len(txs))
+	for _, tx := range txs {
+		if !hasWallet(wallets, tx.Wallet) {
+			return fmt.Errorf("wallet %q not found", tx.Wallet)
+		}
+		rows = append(rows, []interface{}{
+			tx.ID,
+			tx.Date.Format(dateLayout),
+			string(tx.Type),
+			tx.Amount,
+			tx.Wallet,
+			tx.Category,
+			tx.Description,
+			tx.RefID,
+			string(tx.Direction),
+			"",
+		})
+	}
+	return c.appendRows(ctx, sheetTransactions+"!A:J", "RAW", rows)
+}
+
+func hasWallet(wallets []model.Wallet, name string) bool {
+	for _, w := range wallets {
+		if w.Name == name {
+			return true
 		}
 	}
-	return -1, 0, fmt.Errorf("wallet %q not found", walletName)
+	return false
 }
 
-// GetLastTransaction returns the most recently appended transaction and its
-// 1-indexed sheet row, or ErrNoTransactions if the sheet is empty.
-func (c *Client) GetLastTransaction(ctx context.Context) (model.Transaction, int, error) {
+// CancelLast marks the most recent active transaction as cancelled — both
+// legs, if it is a transfer — by writing note into its Cancelled column. The
+// rows stay in the sheet as history; the balance formula and recaps skip
+// them. It returns what it cancelled, or ErrNoTransactions.
+func (c *Client) CancelLast(ctx context.Context, note string) ([]model.Transaction, error) {
+	entries, err := c.readTransactions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	targets := lastActive(entries)
+	if len(targets) == 0 {
+		return nil, ErrNoTransactions
+	}
+
+	data := make([]*sheets.ValueRange, len(targets))
+	cancelled := make([]model.Transaction, len(targets))
+	for i, e := range targets {
+		data[i] = &sheets.ValueRange{
+			Range:  fmt.Sprintf("%s!J%d", sheetTransactions, e.row),
+			Values: [][]interface{}{{note}},
+		}
+		cancelled[i] = e.tx
+	}
+	_, err = c.svc.Spreadsheets.Values.BatchUpdate(c.spreadsheetID, &sheets.BatchUpdateValuesRequest{
+		ValueInputOption: "RAW",
+		Data:             data,
+	}).Context(ctx).Do()
+	if err != nil {
+		return nil, fmt.Errorf("mark cancelled: %w", err)
+	}
+	return cancelled, nil
+}
+
+// lastActive returns the last non-cancelled entry, followed by the other
+// active leg sharing its RefID if it is a transfer. Empty when nothing is
+// left to cancel.
+func lastActive(entries []entry) []entry {
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].cancelled {
+			continue
+		}
+		targets := []entry{entries[i]}
+		if ref := entries[i].tx.RefID; ref != "" {
+			for j, e := range entries {
+				if j != i && !e.cancelled && e.tx.RefID == ref {
+					targets = append(targets, e)
+				}
+			}
+		}
+		return targets
+	}
+	return nil
+}
+
+// entry is a transaction with where it sits in the sheet.
+type entry struct {
+	tx        model.Transaction
+	row       int // 1-indexed sheet row
+	cancelled bool
+}
+
+// readTransactions returns every well-formed transaction row, in sheet order.
+func (c *Client) readTransactions(ctx context.Context) ([]entry, error) {
 	var resp *sheets.ValueRange
 	err := c.withRecovery(ctx, func() error {
 		var innerErr error
-		resp, innerErr = c.svc.Spreadsheets.Values.Get(c.spreadsheetID, sheetTransactions+"!A2:I").Context(ctx).Do()
-		return innerErr
-	})
-	if err != nil {
-		return model.Transaction{}, -1, fmt.Errorf("get transactions: %w", err)
-	}
-	if len(resp.Values) == 0 {
-		return model.Transaction{}, -1, ErrNoTransactions
-	}
-
-	row := resp.Values[len(resp.Values)-1]
-	rowNumber := len(resp.Values) + 1 // data starts at row 2, so last row = count + 1
-
-	tx, err := parseTransactionRow(row)
-	if err != nil {
-		return model.Transaction{}, -1, err
-	}
-	return tx, rowNumber, nil
-}
-
-// GetTransactionsInRange returns all transactions with Date in [from, to).
-func (c *Client) GetTransactionsInRange(ctx context.Context, from, to time.Time) ([]model.Transaction, error) {
-	var resp *sheets.ValueRange
-	err := c.withRecovery(ctx, func() error {
-		var innerErr error
-		resp, innerErr = c.svc.Spreadsheets.Values.Get(c.spreadsheetID, sheetTransactions+"!A2:I").Context(ctx).Do()
+		resp, innerErr = c.svc.Spreadsheets.Values.Get(c.spreadsheetID, sheetTransactions+"!A2:J").Context(ctx).Do()
 		return innerErr
 	})
 	if err != nil {
 		return nil, fmt.Errorf("get transactions: %w", err)
 	}
 
-	var result []model.Transaction
-	for _, row := range resp.Values {
+	var entries []entry
+	for i, row := range resp.Values {
 		tx, err := parseTransactionRow(row)
 		if err != nil {
-			continue // skip malformed rows rather than failing the whole recap
+			continue // skip malformed rows rather than failing the whole read
 		}
-		if tx.Date.Before(from) || !tx.Date.Before(to) {
+		entries = append(entries, entry{
+			tx:        tx,
+			row:       i + 2, // data starts at row 2
+			cancelled: len(row) >= 10 && strings.TrimSpace(fmt.Sprint(row[9])) != "",
+		})
+	}
+	return entries, nil
+}
+
+// GetTransactionsInRange returns all active (not cancelled) transactions with
+// Date in [from, to).
+func (c *Client) GetTransactionsInRange(ctx context.Context, from, to time.Time) ([]model.Transaction, error) {
+	entries, err := c.readTransactions(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []model.Transaction
+	for _, e := range entries {
+		if e.cancelled || e.tx.Date.Before(from) || !e.tx.Date.Before(to) {
 			continue
 		}
-		result = append(result, tx)
+		result = append(result, e.tx)
 	}
 	return result, nil
-}
-
-// GetTransactionRow returns the transaction stored at a specific 1-indexed
-// sheet row, or ErrNoTransactions if that row has no data (e.g. row 1 is the
-// header, or the row is out of range).
-func (c *Client) GetTransactionRow(ctx context.Context, rowNumber int) (model.Transaction, error) {
-	if rowNumber < 2 {
-		return model.Transaction{}, ErrNoTransactions
-	}
-	rangeStr := fmt.Sprintf("%s!A%d:I%d", sheetTransactions, rowNumber, rowNumber)
-	var resp *sheets.ValueRange
-	err := c.withRecovery(ctx, func() error {
-		var innerErr error
-		resp, innerErr = c.svc.Spreadsheets.Values.Get(c.spreadsheetID, rangeStr).Context(ctx).Do()
-		return innerErr
-	})
-	if err != nil {
-		return model.Transaction{}, fmt.Errorf("get transaction row: %w", err)
-	}
-	if len(resp.Values) == 0 {
-		return model.Transaction{}, ErrNoTransactions
-	}
-	return parseTransactionRow(resp.Values[0])
-}
-
-// DeleteTransactionRow removes a single row (1-indexed) from the Transactions sheet.
-func (c *Client) DeleteTransactionRow(ctx context.Context, rowNumber int) error {
-	sheetID, err := c.getSheetID(ctx, sheetTransactions)
-	if err != nil {
-		// Tab may have been deleted — recreate it and retry once.
-		if recErr := c.InitSheets(ctx); recErr != nil {
-			return err
-		}
-		sheetID, err = c.getSheetID(ctx, sheetTransactions)
-		if err != nil {
-			return err
-		}
-	}
-
-	_, err = c.svc.Spreadsheets.BatchUpdate(c.spreadsheetID, &sheets.BatchUpdateSpreadsheetRequest{
-		Requests: []*sheets.Request{
-			{
-				DeleteDimension: &sheets.DeleteDimensionRequest{
-					Range: &sheets.DimensionRange{
-						SheetId:    sheetID,
-						Dimension:  "ROWS",
-						StartIndex: int64(rowNumber - 1),
-						EndIndex:   int64(rowNumber),
-					},
-				},
-			},
-		},
-	}).Context(ctx).Do()
-	if err != nil {
-		return fmt.Errorf("delete transaction row: %w", err)
-	}
-	return nil
-}
-
-func (c *Client) getSheetID(ctx context.Context, title string) (int64, error) {
-	resp, err := c.svc.Spreadsheets.Get(c.spreadsheetID).Context(ctx).Do()
-	if err != nil {
-		return 0, fmt.Errorf("get spreadsheet: %w", err)
-	}
-	for _, s := range resp.Sheets {
-		if s.Properties.Title == title {
-			return s.Properties.SheetId, nil
-		}
-	}
-	return 0, fmt.Errorf("sheet %q not found", title)
 }
 
 func parseTransactionRow(row []interface{}) (model.Transaction, error) {
@@ -371,11 +489,11 @@ func parseTransactionRow(row []interface{}) (model.Transaction, error) {
 	if err != nil {
 		return model.Transaction{}, fmt.Errorf("parse amount: %w", err)
 	}
-	// Dates are stored as local wall-clock time (see AddTransaction), so they
+	// Dates are stored as local wall-clock time (see AddTransactions), so they
 	// must be parsed back in Local — time.Parse defaults to UTC for a layout
 	// with no zone, which would silently shift every timestamp by the local
 	// UTC offset.
-	date, _ := time.ParseInLocation("2006-01-02 15:04:05", fmt.Sprint(row[1]), time.Local)
+	date, _ := time.ParseInLocation(dateLayout, fmt.Sprint(row[1]), time.Local)
 	refID := ""
 	if len(row) >= 8 {
 		refID = fmt.Sprint(row[7])
@@ -416,18 +534,11 @@ func (c *Client) GetSummary(ctx context.Context) (string, error) {
 	return summary, nil
 }
 
-func (c *Client) writeRow(ctx context.Context, rangeStr string, values []interface{}) error {
-	_, err := c.svc.Spreadsheets.Values.Update(c.spreadsheetID, rangeStr,
-		&sheets.ValueRange{Values: [][]interface{}{values}}).
-		ValueInputOption("RAW").Context(ctx).Do()
-	return err
-}
-
-func (c *Client) appendRow(ctx context.Context, rangeStr string, values []interface{}) error {
+func (c *Client) appendRows(ctx context.Context, rangeStr, inputOption string, rows [][]interface{}) error {
 	return c.withRecovery(ctx, func() error {
 		_, err := c.svc.Spreadsheets.Values.Append(c.spreadsheetID, rangeStr,
-			&sheets.ValueRange{Values: [][]interface{}{values}}).
-			ValueInputOption("RAW").InsertDataOption("INSERT_ROWS").Context(ctx).Do()
+			&sheets.ValueRange{Values: rows}).
+			ValueInputOption(inputOption).InsertDataOption("INSERT_ROWS").Context(ctx).Do()
 		return err
 	})
 }
