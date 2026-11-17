@@ -231,17 +231,30 @@ func cloudHandler(h *handler.MessageHandler, sender messaging.Sender) whatsappcl
 // returns. Every transport funnels through here, so their behaviour cannot
 // drift apart.
 func dispatch(ctx context.Context, h *handler.MessageHandler, sender messaging.Sender, chatID string, msg handler.Message) {
+	start := time.Now()
 	reply := h.Handle(ctx, chatID, msg)
+	handled := time.Since(start)
+
 	switch {
 	case reply.Document != nil:
 		if err := sender.SendDocument(ctx, chatID, reply.Document, reply.Filename, reply.Caption); err != nil {
 			log.Printf("send document to %s: %v", chatID, err)
+			return
 		}
 	case reply.Text != "":
 		if err := sender.SendText(ctx, chatID, reply.Text); err != nil {
 			log.Printf("send message to %s: %v", chatID, err)
+			return
 		}
+	default:
+		return
 	}
+	// Split so a slow reply can be pinned on the work (Gemini, Sheets) or on
+	// the chat platform's own API.
+	total := time.Since(start)
+	log.Printf("Replied to %s in %s (handle %s, send %s)", chatID,
+		total.Round(time.Millisecond), handled.Round(time.Millisecond),
+		(total - handled).Round(time.Millisecond))
 }
 
 // isTelegramRejection reports whether Telegram itself refused the request (a

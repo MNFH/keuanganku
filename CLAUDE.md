@@ -18,8 +18,10 @@ go test ./internal/model -run TestFormatAmount     # one test
 go test ./internal/model -run 'TestFormatAmount/negative_six_digits' -v   # one subtest
 ```
 
-Tested: `internal/model` (`FormatAmount`, `BalanceDelta`), `internal/handler` (`parseAmount`),
-`internal/ai` (`Intent.Command`, `Mutates`, `normalize`), `internal/telegram` (`ToHTML`), and
+Tested: `internal/model` (`FormatAmount`, `BalanceDelta`), `internal/handler` (`parseAmount`,
+`lockSheet`), `internal/ai` (`Intent.Command`, `Mutates`, `normalize`), `internal/telegram`
+(`ToHTML`, the per-chat `chatQueues`), `internal/sheets` (`lastActive`, `openingBalance`, the
+balance formula's signs), and
 `internal/whatsappcloud` (webhook signature verification, the verify handshake, payload
 parsing). Still untested but equally dependency-free: `recap.Compute`, the `*Range` helpers,
 `ParseIndoMonth`, `matchWalletPrefix`, `parseTransactionRow`, `nextFireTime`.
@@ -48,8 +50,9 @@ This split is the single most important thing to understand, and the README unde
 by calling Sheets an "optional export":
 
 - **Google Sheets is the transaction database**, one spreadsheet per registered chat, with
-  two tabs created and headed by `sheets.InitSheets`: `Wallets` (Name, Balance, Created At)
-  and `Transactions` (ID, Date, Type, Amount, Wallet, Category, Description, RefID, Direction).
+  two tabs created and headed by `sheets.InitSheets`: `Wallets` (Name, Balance, Created At,
+  Opening Balance) and `Transactions` (ID, Date, Type, Amount, Wallet, Category, Description,
+  RefID, Direction, Cancelled).
   All reads and writes of financial data go through `internal/sheets`.
 - **MySQL holds only the `users` table** — a `chat ID → spreadsheet_id` mapping, auto-migrated
   on startup by `userstore.New`. The database itself must already exist; only the table is created.
@@ -141,35 +144,50 @@ rather than letting the model invent labels.
 to the same sheet reuse one client. Because of that, `/hapus` only evicts the cache entry after
 `users.AnyUses(spreadsheetID)` confirms no other chat still points at it.
 
-### Wallet balances are denormalized — respect the invariant
+### The ledger is append-only — balances are a formula the bot never writes
 
-`Wallets!B` stores a running balance; it is never recomputed from the transaction history.
-Every write path must keep the pair in sync, and `model.Transaction.BalanceDelta` is the one
-place that decides a transaction's sign. Any undo must apply `-BalanceDelta()` *and* delete
-the row.
+`Wallets!B` (Balance) is a **spreadsheet formula**: Opening Balance (`Wallets!D`) plus every
+transaction on that wallet whose `Transactions!J` (Cancelled) is empty. The bot reads it and
+**never writes it**. This is what makes several chats on one sheet safe: every write is a
+single append or a single batch, so there is no read-modify-write to lose and nothing to roll
+back. Don't reintroduce a write path that stores a computed balance.
 
-There are no transactions across the Sheets API, so multi-step writes roll back by hand.
-`sheets.AddTransaction` is the canonical shape, and its ordering is deliberate:
+- **Recording** (`AddTransactions`) checks every wallet exists, then appends all rows in **one**
+  call — a transfer's two legs land together or not at all.
+- **Undo** (`CancelLast`, behind `/batal`) writes `batal <time>` into column J of the last
+  active row, plus its transfer pair, in one batch. Rows are never deleted; they stay as history.
+  `GetTransactionsInRange` skips cancelled rows, so recaps and the PDF do too.
+- **New wallets** (`AddWallet`) are appended with `balanceFormula` and opening balance 0, written
+  `USER_ENTERED` so the formula evaluates. The formula finds its own row with `INDEX(..,ROW())`,
+  so it is correct wherever the append lands. The name and timestamp are prefixed with `'` so
+  Sheets keeps them as text (`007` must not become the number 7). `validWalletName` requires
+  names to start with a letter or digit and contain no `* ? ~`: SUMIFS reads its criterion as a
+  pattern (`= < >` operators, `* ? ~` wildcards), so such a wallet would never count its own
+  transactions (the live test caught this).
+- **Legacy sheets** (typed balances, from before this design or hand-edited) are converted once
+  per client by `EnsureBalanceFormulas`: it sets Opening Balance = typed balance − the wallet's
+  active transactions, so the displayed number doesn't change. Formulas the user wrote are left
+  alone. `handleCommand` refuses to run if this fails — a transaction written against a
+  still-typed balance would be absorbed into the opening balance and vanish.
 
-1. Resolve the wallet row **first** (`findWalletRow`), so an unknown wallet fails before
-   anything is written.
-2. Append the transaction row **before** updating the balance. If the balance write then
-   fails, the sheet is left with a *visible* extra row rather than silent balance drift —
-   the strictly more recoverable failure.
-3. On a balance-write failure, roll the appended row back via `deleteRowIfLastWithID`,
-   which refuses to delete a row that is no longer last (it would belong to another write).
+`balanceFormula` and `model.Transaction.BalanceDelta` must agree on every sign;
+`TestBalanceFormulaMatchesBalanceDelta` and `TestOpeningBalance` guard that.
 
-When rollback itself fails, the returned error wraps **`sheets.ErrInconsistent`**, and
-callers must `errors.Is` it and tell the user to check the sheet by hand instead of
-reporting a plain failure. `cmdTransfer` and `undoTransfer` follow the same manual-rollback
-pattern for their two-leg writes.
+`handleCommand` still holds `lockSheet(spreadsheetID)` for the whole command, so `/batal`
+can't race a write and the one-time conversion runs once. It covers every transport (the Cloud
+webhook dispatches each message on its own goroutine) and chats sharing a sheet. The Gemini
+parse runs *before* `handleCommand`, outside the lock. Telegram runs chats concurrently via
+`chatQueues`, but keeps each chat's messages in order.
+
+`internal/sheets/live_test.go` (build tag `live`) exercises all of this against the real API.
+It needs a **blank** spreadsheet shared with the service account — never a real ledger.
 
 ### Transfers are two linked rows
 
-A `/transfer` writes two rows sharing a generated `RefID`: the `out` leg (source wallet) first,
-then the `in` leg. `Direction` disambiguates them, since `Type == Transfer` alone cannot.
-Because the out leg is written first, `/batal` detects a transfer by checking whether the row
-*above* the last one carries the same `RefID`.
+A `/transfer` writes two rows sharing a generated `RefID`: the `out` leg then the `in` leg.
+`Direction` disambiguates them, since `Type == Transfer` alone cannot. `/batal` finds the pair
+by `RefID` anywhere in the sheet, not by position — with several chats appending, another row
+can land between the legs.
 
 `recap.Compute` **excludes transfers entirely** — moving money between your own wallets is
 neither income nor spending.
@@ -177,8 +195,8 @@ neither income nor spending.
 ### Sheets row-index conventions
 
 Data starts at row 2 because row 1 is the header, so a slice index maps to a sheet row as
-`i + 2` (see `findWalletRow`). When deleting more than one row, delete the **higher index
-first** so the lower one does not shift — `undoTransfer` depends on this.
+`i + 2` (see `readTransactions`). Rows are only appended, never deleted, so a row number stays
+valid for the life of a command.
 
 `sheets.withRecovery` wraps most value calls: if the API returns the 400 "Unable to parse range"
 error that means a required tab was deleted, it recreates the tabs via `InitSheets` and retries

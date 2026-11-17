@@ -76,15 +76,19 @@ type Message struct {
 	PhotoMIME string
 }
 
-// Handler processes one inbound message.
+// Handler processes one inbound message. It may be called concurrently for
+// different chats, but never for the same chat.
 type Handler func(ctx context.Context, msg Message)
 
 // Run long-polls for updates until ctx is cancelled, dispatching each message
-// to handle. Transient failures are logged by the caller's handler; polling
-// itself backs off rather than spinning.
+// to handle — in order within a chat, concurrently across chats. Transient
+// failures are logged by the caller's handler; polling itself backs off rather
+// than spinning. On return, every dispatched message has finished.
 func (b *Bot) Run(ctx context.Context, handle Handler, logf func(string, ...any)) {
 	var offset int64
 	backoff := time.Second
+	queues := newChatQueues()
+	defer queues.wait()
 
 	for {
 		if ctx.Err() != nil {
@@ -129,18 +133,22 @@ func (b *Bot) Run(ctx context.Context, handle Handler, logf func(string, ...any)
 				From:   msg.From.name(),
 				Text:   msg.text(),
 			}
+			fileID := msg.largestPhotoID()
 
-			if fileID := msg.largestPhotoID(); fileID != "" {
-				data, err := b.download(ctx, fileID)
-				if err != nil {
-					logf("telegram: download photo: %v", err)
-					continue
+			// The photo download runs inside the job too, so it doesn't
+			// stall polling for other chats.
+			queues.submit(out.ChatID, func() {
+				if fileID != "" {
+					data, err := b.download(ctx, fileID)
+					if err != nil {
+						logf("telegram: download photo: %v", err)
+						return
+					}
+					out.Photo = data
+					out.PhotoMIME = "image/jpeg" // Telegram re-encodes photos as JPEG
 				}
-				out.Photo = data
-				out.PhotoMIME = "image/jpeg" // Telegram re-encodes photos as JPEG
-			}
-
-			handle(ctx, out)
+				handle(ctx, out)
+			})
 		}
 	}
 }
