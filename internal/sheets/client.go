@@ -463,6 +463,29 @@ func (c *Client) readTransactions(ctx context.Context) ([]entry, error) {
 	return entries, nil
 }
 
+// GetActiveTransactions returns every active (not cancelled) transaction in
+// Ledger order, i.e. the order the rows were appended. That order matters:
+// its last element is exactly what CancelLast would cancel, so callers can
+// show the /batal target from the same read.
+func (c *Client) GetActiveTransactions(ctx context.Context) ([]model.Transaction, error) {
+	entries, err := c.readTransactions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return activeTransactions(entries), nil
+}
+
+// activeTransactions drops cancelled entries, keeping sheet order.
+func activeTransactions(entries []entry) []model.Transaction {
+	var result []model.Transaction
+	for _, e := range entries {
+		if !e.cancelled {
+			result = append(result, e.tx)
+		}
+	}
+	return result
+}
+
 // GetTransactionsInRange returns all active (not cancelled) transactions with
 // Date in [from, to).
 func (c *Client) GetTransactionsInRange(ctx context.Context, from, to time.Time) ([]model.Transaction, error) {

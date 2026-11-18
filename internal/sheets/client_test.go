@@ -69,6 +69,52 @@ func TestLastActive(t *testing.T) {
 	}
 }
 
+func TestActiveTransactions(t *testing.T) {
+	tests := []struct {
+		name    string
+		entries []entry
+		want    string
+	}{
+		{"empty sheet", nil, ""},
+		{"drops cancelled, keeps sheet order", []entry{
+			{tx: tx("a", model.Expense, 10, "jago"), row: 2},
+			{tx: tx("b", model.Income, 20, "jago"), row: 3, cancelled: true},
+			{tx: leg("out", "r1", model.DirectionOut, 50, "jago"), row: 4},
+			{tx: leg("in", "r1", model.DirectionIn, 50, "bsi"), row: 5},
+			{tx: tx("c", model.Expense, 5, "bsi"), row: 6},
+		}, "a,out,in,c"},
+		{"everything cancelled", []entry{
+			{tx: tx("a", model.Expense, 10, "jago"), row: 2, cancelled: true},
+		}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []string
+			for _, tx := range activeTransactions(tt.entries) {
+				got = append(got, tx.ID)
+			}
+			if s := strings.Join(got, ","); s != tt.want {
+				t.Errorf("activeTransactions = %q, want %q", s, tt.want)
+			}
+		})
+	}
+}
+
+// The last active transaction must be what CancelLast targets, so history can
+// mark the /batal target from the same read.
+func TestActiveTransactionsEndsWithUndoTarget(t *testing.T) {
+	entries := []entry{
+		{tx: tx("a", model.Expense, 10, "jago"), row: 2},
+		{tx: tx("b", model.Income, 20, "jago"), row: 3},
+		{tx: tx("c", model.Income, 30, "jago"), row: 4, cancelled: true},
+	}
+	active := activeTransactions(entries)
+	target := lastActive(entries)
+	if len(target) == 0 || active[len(active)-1].ID != target[0].tx.ID {
+		t.Errorf("last active = %s, CancelLast target = %s", active[len(active)-1].ID, ids(target))
+	}
+}
+
 func TestValidWalletName(t *testing.T) {
 	for _, name := range []string{"jago", "BCA", "Jago Kantong Belanja", "007", "GoPay-2", "bank_dki", "Émoney"} {
 		if err := validWalletName(name); err != nil {
