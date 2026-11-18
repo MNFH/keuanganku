@@ -1,0 +1,13 @@
+- D1: keep the undo marker (R6); checking before undoing is the feature's purpose, and filters make the marker necessary.
+- D2: keep natural-language history (R7.4–R7.5); every other command already works from free text.
+- D3: keep splitting long replies (R7.6); descriptions are never shortened (user decision), so even 10 entries can exceed Telegram's limit.
+- D4: cut R4.4; the bot never produces a half-cancelled Transfer, only a hand edit can. Design must just not fail on it.
+- D5: merge R5.3, R5.4 and R8.5 into one empty reply that names any filter in force; this removes the contradiction.
+- D6: merge R3.3, R8.4 and R8.6 into R2.1. D7: cut R1.3, R1.7 and R7.3, and keep R5.6 (read-only is worth testing on its own).
+- D8: if the whole argument text matches a Wallet, it is that Wallet; otherwise read count, then Period, then Wallet, and reply with the format for leftover or out-of-order text. Never guess.
+- D9: Period = every period the recap command accepts, named months and dates included, with the same boundaries.
+- R1.6 (full descriptions) and the /riwayat + /history alias are user decisions from intake; do not reopen them.
+- D10: a History_Entry is split across messages only when it alone exceeds the platform limit; descriptions stay unshortened.
+- D11: a leading number that starts a valid Period is that Period (5 januari); otherwise it is the count (15, 10 5 januari).
+- D12: date- or month-shaped text that the recap command rejects gets the Format_Reply; other unmatched text is a Wallet name and gets the Wallet_Not_Found_Reply.
+- D13: history runs the same housekeeping as every command (legacy-balance conversion, tab recreation); R5.6 only forbids adding or cancelling and changing a shown balance.
