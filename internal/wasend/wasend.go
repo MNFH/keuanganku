@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/nurfaizh/keuanganku/internal/messaging"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
@@ -27,13 +28,20 @@ func (s Sender) SendText(ctx context.Context, chatID, text string) error {
 	if err != nil {
 		return fmt.Errorf("parse jid %q: %w", chatID, err)
 	}
-	if _, err := s.Client.SendMessage(ctx, jid, &waE2E.Message{
-		Conversation: proto.String(text),
-	}); err != nil {
-		return fmt.Errorf("send message: %w", err)
+	// WhatsApp allows far longer messages than the other platforms; split
+	// only past maxTextLen, as a safety net.
+	for _, chunk := range messaging.SplitText(text, maxTextLen) {
+		if _, err := s.Client.SendMessage(ctx, jid, &waE2E.Message{
+			Conversation: proto.String(chunk),
+		}); err != nil {
+			return fmt.Errorf("send message: %w", err)
+		}
 	}
 	return nil
 }
+
+// maxTextLen is well under WhatsApp's own message length limit.
+const maxTextLen = 60000
 
 func (s Sender) SendDocument(ctx context.Context, chatID string, data []byte, filename, caption string) error {
 	jid, err := types.ParseJID(chatID)

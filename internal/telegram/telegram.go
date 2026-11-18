@@ -31,6 +31,11 @@ const (
 	// maxPhotoBytes caps what we'll download from a photo message, so an
 	// oversized upload can't balloon memory.
 	maxPhotoBytes = 12 << 20 // 12 MiB
+
+	// maxTextLen keeps each message under Telegram's 4096-character limit
+	// (counted, like SplitText, in UTF-16 units),
+	// with headroom for the entities ToHTML adds.
+	maxTextLen = 4000
 )
 
 // Bot is a Telegram transport. It satisfies messaging.Sender.
@@ -156,17 +161,25 @@ func (b *Bot) Run(ctx context.Context, handle Handler, logf func(string, ...any)
 // SendText delivers a plain reply. The bot's messages are written in
 // WhatsApp's *bold* / _italic_ convention, so they are converted to Telegram
 // HTML on the way out.
+//
+// Telegram caps a message at 4096 characters, so a longer reply is split
+// into several messages, in order, before conversion: splitting the plain
+// text keeps every *bold* pair inside one chunk.
 func (b *Bot) SendText(ctx context.Context, chatID, text string) error {
 	id, err := messaging.ParseTelegramChatID(chatID)
 	if err != nil {
 		return err
 	}
-	_, err = b.call(ctx, "sendMessage", map[string]any{
-		"chat_id":    id,
-		"text":       ToHTML(text),
-		"parse_mode": "HTML",
-	})
-	return err
+	for _, chunk := range messaging.SplitText(text, maxTextLen) {
+		if _, err := b.call(ctx, "sendMessage", map[string]any{
+			"chat_id":    id,
+			"text":       ToHTML(chunk),
+			"parse_mode": "HTML",
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // SendDocument uploads a file (the monthly PDF, or an on-demand recap).

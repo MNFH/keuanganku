@@ -39,6 +39,10 @@ const (
 	// wrote. See https://developers.facebook.com/docs/whatsapp/cloud-api/support/error-codes
 	reengagementErrorCode = 131047
 
+	// maxTextLen keeps each text body under the Cloud API's 4096-character
+	// limit (SplitText counts UTF-16 units, the stricter reading).
+	maxTextLen = 4000
+
 	maxMediaBytes = 16 << 20 // generous for a PDF or a receipt photo
 )
 
@@ -93,13 +97,20 @@ func (c *Client) SendText(ctx context.Context, chatID, text string) error {
 	if err != nil {
 		return err
 	}
-	return c.postMessage(ctx, map[string]any{
-		"messaging_product": "whatsapp",
-		"recipient_type":    "individual",
-		"to":                waID,
-		"type":              "text",
-		"text":              map[string]any{"body": text, "preview_url": false},
-	})
+	// The Cloud API caps a text body at 4096 characters; send a longer reply
+	// as several messages, in order.
+	for _, chunk := range messaging.SplitText(text, maxTextLen) {
+		if err := c.postMessage(ctx, map[string]any{
+			"messaging_product": "whatsapp",
+			"recipient_type":    "individual",
+			"to":                waID,
+			"type":              "text",
+			"text":              map[string]any{"body": chunk, "preview_url": false},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // SendDocument uploads the file and sends it by media ID. Uploading rather
