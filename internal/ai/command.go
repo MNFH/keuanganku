@@ -59,6 +59,9 @@ func (in Intent) Command() (string, bool) {
 	case ActionUndo:
 		return "/batal", true
 
+	case ActionHistory:
+		return in.historyCommand(), true
+
 	case ActionHelp:
 		return "/help", true
 
@@ -118,6 +121,37 @@ func recapArgs(p Period) string {
 		// PeriodNone and PeriodThisMonth: bare /rekap is already this month.
 		return ""
 	}
+}
+
+// historyCommand renders /riwayat [count] [period] [wallet]. Every part is
+// optional, so a history request always yields a command. A wallet the user
+// named but that is not on their list travels as WalletText, so the command
+// path answers "wallet not found" rather than listing every wallet.
+func (in Intent) historyCommand() string {
+	parts := []string{"/riwayat"}
+	if in.Count > 0 {
+		parts = append(parts, strconv.Itoa(in.Count))
+	}
+	if p := historyPeriodArgs(in.Period); p != "" {
+		parts = append(parts, p)
+	}
+	switch {
+	case in.Wallet != "":
+		parts = append(parts, sanitizeLine(in.Wallet))
+	case sanitizeLine(in.WalletText) != "":
+		parts = append(parts, sanitizeLine(in.WalletText))
+	}
+	return strings.Join(parts, " ")
+}
+
+// historyPeriodArgs differs from recapArgs in one case: /rekap defaults to
+// this month, but /riwayat with no period means no period, so this month must
+// be named.
+func historyPeriodArgs(p Period) string {
+	if p == PeriodThisMonth {
+		return "bulanan"
+	}
+	return recapArgs(p)
 }
 
 // amountArg renders an amount as a plain integer-ish string that parseAmount

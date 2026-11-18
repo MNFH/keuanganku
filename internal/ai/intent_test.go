@@ -63,3 +63,22 @@ func TestNormalizeOnlyMatchesTheWholeValue(t *testing.T) {
 		t.Errorf("Description = %q, want it unchanged", in.Description)
 	}
 }
+
+// A "none" wallet_text would otherwise render "/riwayat none" and answer
+// "wallet none not found".
+func TestNormalizeHistoryFields(t *testing.T) {
+	in := Intent{Action: ActionHistory, WalletText: "None", Count: -5}
+	in.normalize()
+	if in.WalletText != "" || in.Count != 0 {
+		t.Errorf("got WalletText %q Count %d, want empty and 0", in.WalletText, in.Count)
+	}
+	if cmd, _ := in.Command(); cmd != "/riwayat" {
+		t.Errorf("Command() = %q, want /riwayat", cmd)
+	}
+
+	real := Intent{Action: ActionHistory, WalletText: "Dana", Count: 7}
+	real.normalize()
+	if real.WalletText != "Dana" || real.Count != 7 {
+		t.Errorf("normalize changed real values: %+v", real)
+	}
+}
