@@ -58,6 +58,56 @@ func sortedCategoryTotals(byCategory map[string]float64) []CategoryTotal {
 	return entries
 }
 
+// DailyTotal is one calendar day's income and expense within a period.
+type DailyTotal struct {
+	Date    time.Time // local midnight at the start of the day
+	Income  float64
+	Expense float64
+}
+
+// Net returns the day's income minus its expense.
+func (d DailyTotal) Net() float64 { return d.Income - d.Expense }
+
+// Daily returns exactly one DailyTotal per calendar day in [from, to), in
+// ascending order, including days without any transaction. Like Compute it
+// counts only income and expense, never transfers. A transaction is assigned
+// to its date's calendar day in from's location; one whose day lies outside
+// the period is skipped rather than given a row. from should be a local
+// midnight, as every *Range helper returns. Days are stepped with AddDate,
+// not 24h, so a DST change can't skip or double a day.
+func Daily(txs []model.Transaction, from, to time.Time) []DailyTotal {
+	type dayKey struct {
+		y int
+		m time.Month
+		d int
+	}
+	keyOf := func(t time.Time) dayKey {
+		y, m, d := t.In(from.Location()).Date()
+		return dayKey{y, m, d}
+	}
+
+	var days []DailyTotal
+	index := map[dayKey]int{}
+	for d := from; d.Before(to); d = d.AddDate(0, 0, 1) {
+		index[keyOf(d)] = len(days)
+		days = append(days, DailyTotal{Date: d})
+	}
+
+	for _, tx := range txs {
+		i, ok := index[keyOf(tx.Date)]
+		if !ok {
+			continue
+		}
+		switch tx.Type {
+		case model.Income:
+			days[i].Income += tx.Amount
+		case model.Expense:
+			days[i].Expense += tx.Amount
+		}
+	}
+	return days
+}
+
 // MonthRange returns [from, to) for the calendar month monthOffset months
 // from now (0 = current month, -1 = last month, ...).
 func MonthRange(now time.Time, monthOffset int) (from, to time.Time) {
