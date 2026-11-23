@@ -160,10 +160,10 @@ func (h *MessageHandler) handleCommand(ctx context.Context, senderJID, text stri
 // That matters because the bot also sits in group chats, where replying to
 // every message would be noise — and because a guessed transaction writes
 // silently to someone's ledger. Infrastructure errors are surfaced only when
-// the message carried an image, which is a deliberate act; for plain prose
-// they are logged and swallowed.
+// the message looks like a transaction (see looksLikeEntry); for ordinary
+// chat they are logged and swallowed.
 func (h *MessageHandler) handleNaturalLanguage(ctx context.Context, chatJID string, msg Message) Reply {
-	deliberate := len(msg.Image) > 0
+	deliberate := looksLikeEntry(msg)
 
 	sheetsClient, err := h.getSheetsClient(chatJID)
 	if err != nil {
@@ -195,7 +195,7 @@ func (h *MessageHandler) handleNaturalLanguage(ctx context.Context, chatJID stri
 	if err != nil {
 		log.Printf("natural language: parse: %v", err)
 		if deliberate {
-			return Reply{Text: "❌ Gagal membaca pesan. Coba lagi atau pakai perintah manual (/help)."}
+			return Reply{Text: parseFailedMsg}
 		}
 		return Reply{}
 	}

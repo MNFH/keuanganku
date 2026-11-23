@@ -16,7 +16,10 @@ import (
 // 2.5-flash-lite is deliberately avoided — that family is access-restricted
 // and being withdrawn. Model IDs retire on a schedule, which is why this is
 // overridable by environment without a rebuild.
-const DefaultGeminiModel = "gemini-3.1-flash-lite"
+//
+// It is a comma-separated fallback list: the later models are used only when
+// an earlier one is overloaded (503 "high demand"), rate limited or retired.
+const DefaultGeminiModel = "gemini-3.1-flash-lite,gemini-3.5-flash,gemini-flash-lite-latest"
 
 type Config struct {
 	GoogleCredentials string

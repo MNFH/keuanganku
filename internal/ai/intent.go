@@ -114,13 +114,21 @@ type Intent struct {
 // Parser classifies messages using the Gemini API.
 type Parser struct {
 	client *genai.Client
-	model  string
+	// models are tried in order; a later one is used only when an earlier one
+	// is overloaded, rate limited, retired or too slow.
+	models []string
 }
 
-// New builds a Parser against the Gemini Developer API.
+// New builds a Parser against the Gemini Developer API. model is one model ID
+// or a comma-separated list of fallbacks, e.g.
+// "gemini-3.1-flash-lite,gemini-3.5-flash".
 func New(ctx context.Context, apiKey, model string) (*Parser, error) {
 	if apiKey == "" {
 		return nil, fmt.Errorf("gemini api key is empty")
+	}
+	models := splitModels(model)
+	if len(models) == 0 {
+		return nil, fmt.Errorf("gemini model is empty")
 	}
 	client, err := genai.NewClient(ctx, &genai.ClientConfig{
 		APIKey:  apiKey,
@@ -129,7 +137,22 @@ func New(ctx context.Context, apiKey, model string) (*Parser, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create gemini client: %w", err)
 	}
-	return &Parser{client: client, model: model}, nil
+	return &Parser{client: client, models: models}, nil
+}
+
+// splitModels turns "a, b,,a" into ["a", "b"]: trimmed, no blanks, no repeats.
+func splitModels(s string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, m := range strings.Split(s, ",") {
+		m = strings.TrimSpace(m)
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	return out
 }
 
 // Request is one message to classify, plus the context the model needs to
@@ -194,51 +217,65 @@ func (p *Parser) Parse(ctx context.Context, req Request) (Intent, error) {
 
 // Retry settings for transient API failures. The free tier's rate limit is
 // low enough (a handful of requests per minute) that a burst of messages can
-// trip it, and the service also returns short-lived 503s under load. Without
-// a retry those surface as the bot silently ignoring a message.
+// trip it, and the service also returns 503 "high demand" for a single model
+// under load, sometimes for minutes. Without a fallback those surface as the
+// bot ignoring a message.
 //
-// Worst case is baseBackoff + 2*baseBackoff plus three request latencies,
-// which stays inside the caller's per-message timeout.
+// Each round tries every model once, each call capped at attemptTimeout, so
+// one slow model cannot use up the caller's whole per-message timeout (60s).
 const (
-	maxAttempts = 3
-	baseBackoff = 2 * time.Second
+	rounds         = 2
+	roundBackoff   = 2 * time.Second
+	attemptTimeout = 20 * time.Second
 )
 
-// generate calls the API, retrying transient failures with exponential
-// backoff. It gives up immediately on anything permanent, such as a bad
-// schema or a rejected key, since retrying those only wastes quota.
+// generate calls the API, moving to the next model on a transient failure
+// and starting another round, after a short pause, once every model failed.
+// It gives up immediately on anything permanent, such as a bad schema or a
+// rejected key, since retrying those only wastes quota.
 func (p *Parser) generate(ctx context.Context, contents []*genai.Content, cfg *genai.GenerateContentConfig) (*genai.GenerateContentResponse, error) {
 	var lastErr error
-	for attempt := range maxAttempts {
-		if attempt > 0 {
+	for round := range rounds {
+		if round > 0 {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(baseBackoff << (attempt - 1)):
+				return nil, fmt.Errorf("%w (last error: %v)", ctx.Err(), lastErr)
+			case <-time.After(roundBackoff):
 			}
 		}
-
-		resp, err := p.client.Models.GenerateContent(ctx, p.model, contents, cfg)
-		if err == nil {
-			return resp, nil
-		}
-		lastErr = err
-		if !retryable(err) {
-			return nil, err
+		for _, model := range p.models {
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("%w (last error: %v)", ctx.Err(), lastErr)
+			}
+			callCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+			resp, err := p.client.Models.GenerateContent(callCtx, model, contents, cfg)
+			cancel()
+			if err == nil {
+				return resp, nil
+			}
+			lastErr = fmt.Errorf("%s: %w", model, err)
+			// A per-call timeout while the message still has time left means
+			// this model is slow right now; another model may answer.
+			slow := errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
+			if !slow && !tryNextModel(err) {
+				return nil, lastErr
+			}
 		}
 	}
-	return nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
+	return nil, fmt.Errorf("all models failed after %d rounds: %w", rounds, lastErr)
 }
 
-// retryable reports whether an error is worth another attempt: rate limiting
-// and the 5xx family, which the service documents as temporary.
-func retryable(err error) bool {
+// tryNextModel reports whether an error is worth another attempt, on this or
+// another model: rate limiting and the 5xx family, which the service
+// documents as temporary, and 404, which is what a retired model ID returns.
+func tryNextModel(err error) bool {
 	var apiErr genai.APIError
 	if !errors.As(err, &apiErr) {
 		return false
 	}
 	switch apiErr.Code {
-	case http.StatusTooManyRequests,
+	case http.StatusNotFound,
+		http.StatusTooManyRequests,
 		http.StatusInternalServerError,
 		http.StatusBadGateway,
 		http.StatusServiceUnavailable,

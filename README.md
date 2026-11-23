@@ -43,7 +43,7 @@ Fill in `.env`:
 - `MYSQL_DSN` — required, e.g. `user:password@tcp(127.0.0.1:3306)/keuanganku?parseTime=true`
 - `GOOGLE_CREDENTIALS_FILE` — path to a Google service-account JSON (defaults to `credentials.json`). Required in practice, since Sheets is where transactions are stored
 - `GEMINI_API_KEY` — optional, from [aistudio.google.com](https://aistudio.google.com). Enables free-form messages and receipt photos; without it the bot runs normally but only answers slash commands
-- `GEMINI_MODEL` — optional, defaults to `gemini-3.1-flash-lite` (chosen for cost; `gemini-3.8-flash` is more accurate if parsing quality disappoints)
+- `GEMINI_MODEL` — optional, a comma-separated fallback list tried in order when a model is overloaded, rate limited or retired; defaults to `gemini-3.1-flash-lite,gemini-3.5-flash,gemini-flash-lite-latest` (flash-lite first for cost; `gemini-3.8-flash` is more accurate if parsing quality disappoints)
 - `TELEGRAM_BOT_TOKEN` — optional, from [@BotFather](https://t.me/BotFather). Serves Telegram alongside WhatsApp
 - `DISABLE_WHATSAPP` — optional, set to `1` to run Telegram-only (skips the QR link entirely)
 - `ENABLE_MONTHLY_REPORT` — optional, set to `1` for the scheduled monthly PDF. **Off by default**: it is the only unprompted message the bot sends, and on the Cloud API that is billable
