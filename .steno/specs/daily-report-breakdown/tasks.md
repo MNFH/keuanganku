@@ -14,7 +14,7 @@
     - _Requirements: 1.1, 1.3, 1.4, 1.6, 3.1, 5.1, 5.3, 5.4, 5.5_ _Design: D-daily-table, D-report-layout, D-indo-labels_
   - [x] 3.3 Add page-break handling in `drawDailyTable`: before each row, if it would cross the bottom margin, `AddPage` and redraw the column header. Keep the heading, header and first row together. Create `internal/report/report_test.go`: a single-day and a 31-day empty period both return bytes starting `%PDF`, and the 31-day document has more pages (via an unexported builder returning the `*gofpdf.Fpdf`). Verify: `go test ./internal/report`.
     - _Requirements: 1.5, 4.5_ _Design: D-daily-table, D-report-layout_
-- [ ] 4. Checkpoint — final
+- [x] 4. Checkpoint — final
   Verify: `go vet ./...`, `go test ./...`. On a registered test chat:
   - `/rekap pdf` (this month): the daily table is the last section, spans pages with headings repeated, lists every day, and its total row matches the summary at the top.
   - `/rekap mingguan lalu pdf`: 7 rows, Senin first.

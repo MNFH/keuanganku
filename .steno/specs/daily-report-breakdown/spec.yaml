@@ -3,7 +3,7 @@ name: daily-report-breakdown
 title: Daily Breakdown in PDF Report
 kind: feature
 mode: gated
-phase: execute
+phase: done
 created: 2026-11-23
 approvals:
   requirements: 2026-11-23
