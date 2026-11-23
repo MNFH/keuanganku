@@ -218,3 +218,41 @@ func TestDailyEmptyPeriod(t *testing.T) {
 		t.Errorf("from > to: len = %d, want 0", len(got))
 	}
 }
+
+func TestIndoWeekday(t *testing.T) {
+	want := map[time.Weekday]string{
+		time.Sunday: "Minggu", time.Monday: "Senin", time.Tuesday: "Selasa", time.Wednesday: "Rabu",
+		time.Thursday: "Kamis", time.Friday: "Jumat", time.Saturday: "Sabtu",
+	}
+	for d, name := range want {
+		if got := IndoWeekday(d); got != name {
+			t.Errorf("IndoWeekday(%v) = %q, want %q", d, got, name)
+		}
+	}
+}
+
+func TestFormatDayShort(t *testing.T) {
+	// One date per month; together they also cover all seven weekdays.
+	tests := []struct {
+		date time.Time
+		want string
+	}{
+		{time.Date(2025, 1, 6, 0, 0, 0, 0, jakarta), "Senin, 6 Jan"},
+		{time.Date(2025, 2, 4, 0, 0, 0, 0, jakarta), "Selasa, 4 Feb"},
+		{time.Date(2025, 3, 5, 0, 0, 0, 0, jakarta), "Rabu, 5 Mar"},
+		{time.Date(2025, 4, 3, 0, 0, 0, 0, jakarta), "Kamis, 3 Apr"},
+		{time.Date(2025, 5, 2, 0, 0, 0, 0, jakarta), "Jumat, 2 Mei"},
+		{time.Date(2025, 6, 7, 0, 0, 0, 0, jakarta), "Sabtu, 7 Jun"},
+		{time.Date(2025, 7, 6, 0, 0, 0, 0, jakarta), "Minggu, 6 Jul"},
+		{time.Date(2025, 8, 17, 0, 0, 0, 0, jakarta), "Minggu, 17 Agu"},
+		{time.Date(2025, 9, 1, 0, 0, 0, 0, jakarta), "Senin, 1 Sep"},
+		{time.Date(2025, 10, 31, 0, 0, 0, 0, jakarta), "Jumat, 31 Okt"},
+		{time.Date(2025, 11, 3, 23, 59, 0, 0, jakarta), "Senin, 3 Nov"},
+		{time.Date(2025, 12, 25, 0, 0, 0, 0, jakarta), "Kamis, 25 Des"},
+	}
+	for _, tt := range tests {
+		if got := FormatDayShort(tt.date); got != tt.want {
+			t.Errorf("FormatDayShort(%s) = %q, want %q", tt.date.Format("2006-01-02"), got, tt.want)
+		}
+	}
+}

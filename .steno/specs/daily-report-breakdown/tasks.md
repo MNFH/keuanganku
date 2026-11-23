@@ -1,9 +1,9 @@
 # Tasks — Daily Breakdown in PDF Report
 
-- [ ] 1. Daily aggregation core
+- [x] 1. Daily aggregation core
   - [x] 1.1 Add `DailyTotal`, `Net()` and `Daily(txs, from, to)` to `internal/recap/recap.go`: pre-fill one zero entry per day stepping with `AddDate(0,0,1)`, bucket Income/Expense by local year-month-day, skip Transfers and out-of-range dates, return empty for `from >= to`. Create `internal/recap/recap_test.go` with `testing/quick` tests for properties 1–4 plus table cases (28/30/31-day months, a Mon–Sun week, a DST-zone month, transfer-only input, a date outside the range). Verify: `go test ./internal/recap`.
     - _Requirements: 1.2, 2.1, 2.2, 2.3, 2.4, 3.2, 3.3_ _Design: D-daily, D-prop-1, D-prop-2, D-prop-3, D-prop-4, D-data, D-errors_
-  - [ ] 1.2 Add `IndoWeekday` and `FormatDayShort` ("Senin, 3 Nov", no year) to `internal/recap/recap.go`, with a table test over all seven weekdays and twelve month abbreviations. Verify: `go test ./internal/recap -run 'Weekday|DayShort'`.
+  - [x] 1.2 Add `IndoWeekday` and `FormatDayShort` ("Senin, 3 Nov", no year) to `internal/recap/recap.go`, with a table test over all seven weekdays and twelve month abbreviations. Verify: `go test ./internal/recap -run 'Weekday|DayShort'`.
     - _Requirements: 5.2_ _Design: D-indo-labels_
 - [ ] 2. Checkpoint — recap core end to end
   Verify: `go vet ./...`, `go test ./internal/recap`. Nothing user-visible changes yet.

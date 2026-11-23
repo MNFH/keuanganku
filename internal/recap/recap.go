@@ -173,3 +173,14 @@ var indoMonthAbbrs = [...]string{"", "Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "
 
 func IndoMonthName(m time.Month) string { return indoMonthNames[int(m)] }
 func IndoMonthAbbr(m time.Month) string { return indoMonthAbbrs[int(m)] }
+
+var indoWeekdays = [...]string{"Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"}
+
+// IndoWeekday returns the Indonesian name of a weekday.
+func IndoWeekday(d time.Weekday) string { return indoWeekdays[int(d)] }
+
+// FormatDayShort renders a date as day name, day of month and abbreviated
+// month, without the year: "Senin, 3 Nov".
+func FormatDayShort(d time.Time) string {
+	return fmt.Sprintf("%s, %d %s", IndoWeekday(d.Weekday()), d.Day(), IndoMonthAbbr(d.Month()))
+}
