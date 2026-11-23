@@ -1,0 +1,11 @@
+# machine-owned by steno; edit phase/approvals only via the CLI
+name: daily-report-breakdown
+title: Daily Breakdown in PDF Report
+kind: feature
+mode: gated
+phase: done
+created: 2026-11-23
+approvals:
+  requirements: 2026-11-23
+  design: 2026-11-23
+  tasks: 2026-11-23

@@ -15,10 +15,21 @@ import (
 
 const maxChartBars = 6
 
-// GenerateMonthly builds a PDF report for the given title and transaction
+// GenerateMonthly builds a PDF report for the given title, period [from, to) and transaction
 // set, along with a snapshot of current wallet balances, and returns the
 // raw PDF bytes.
-func GenerateMonthly(title string, txs []model.Transaction, wallets []model.Wallet) ([]byte, error) {
+func GenerateMonthly(title string, from, to time.Time, txs []model.Transaction, wallets []model.Wallet) ([]byte, error) {
+	pdf := buildMonthly(title, from, to, txs, wallets)
+	var buf bytes.Buffer
+	if err := pdf.Output(&buf); err != nil {
+		return nil, fmt.Errorf("render pdf: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// buildMonthly lays out the report without serialising it, so tests can
+// inspect the document (its page count, for one).
+func buildMonthly(title string, from, to time.Time, txs []model.Transaction, wallets []model.Wallet) *gofpdf.Fpdf {
 	stats := recap.Compute(txs)
 
 	pdf := gofpdf.New("P", "mm", "A4", "")
@@ -60,11 +71,12 @@ func GenerateMonthly(title string, txs []model.Transaction, wallets []model.Wall
 	pdf.Ln(6)
 	drawWalletTable(pdf, tr, contentW, wallets)
 
-	var buf bytes.Buffer
-	if err := pdf.Output(&buf); err != nil {
-		return nil, fmt.Errorf("render pdf: %w", err)
+	// A single-day period already has its figures in the summary above.
+	if days := recap.Daily(txs, from, to); len(days) > 1 {
+		pdf.Ln(6)
+		drawDailyTable(pdf, tr, contentW, days)
 	}
-	return buf.Bytes(), nil
+	return pdf
 }
 
 func drawSummary(pdf *gofpdf.Fpdf, tr func(string) string, w float64, stats recap.Stats) {
@@ -150,6 +162,73 @@ func drawWalletTable(pdf *gofpdf.Fpdf, tr func(string) string, w float64, wallet
 	pdf.SetFont("Helvetica", "B", 10)
 	pdf.CellFormat(colName, 7, tr("Total"), "1", 0, "L", false, 0, "")
 	pdf.CellFormat(colBal, 7, tr("Rp "+model.FormatAmount(total)), "1", 1, "R", false, 0, "")
+}
+
+// drawDailyTable renders one row per day (date, income, expense, difference)
+// and a bold total row summed from those rows. Only the difference cell is
+// coloured, the same way drawSummary colours the period's difference; no
+// row is otherwise emphasised. A table that runs past the page continues on
+// the next one with its column headings repeated, and the section heading is
+// never left alone at the bottom of a page.
+func drawDailyTable(pdf *gofpdf.Fpdf, tr func(string) string, w float64, days []recap.DailyTotal) {
+	const headingH, rowH = 8.0, 7.0
+	_, pageH := pdf.GetPageSize()
+	_, bottom := pdf.GetAutoPageBreak()
+	fits := func(h float64) bool { return pdf.GetY()+h <= pageH-bottom }
+
+	colDate, colAmt := w*0.31, w*0.23
+	header := func() {
+		pdf.SetFont("Helvetica", "B", 10)
+		pdf.SetFillColor(230, 230, 230)
+		pdf.CellFormat(colDate, rowH, tr("Tanggal"), "1", 0, "L", true, 0, "")
+		pdf.CellFormat(colAmt, rowH, tr("Pemasukan"), "1", 0, "R", true, 0, "")
+		pdf.CellFormat(colAmt, rowH, tr("Pengeluaran"), "1", 0, "R", true, 0, "")
+		pdf.CellFormat(colAmt, rowH, tr("Selisih"), "1", 1, "R", true, 0, "")
+	}
+
+	// Heading, column headings and the first row stay together.
+	if !fits(headingH + 2*rowH) {
+		pdf.AddPage()
+	}
+	pdf.SetFont("Helvetica", "B", 12)
+	pdf.CellFormat(w, headingH, tr("Rincian Harian"), "", 1, "L", false, 0, "")
+	header()
+
+	// style is set per row because a repeated header switches to bold.
+	row := func(style, label string, income, expense float64) {
+		if !fits(rowH) {
+			pdf.AddPage()
+			header()
+		}
+		pdf.SetFont("Helvetica", style, 10)
+		pdf.CellFormat(colDate, rowH, tr(label), "1", 0, "L", false, 0, "")
+		pdf.CellFormat(colAmt, rowH, tr("Rp "+model.FormatAmount(income)), "1", 0, "R", false, 0, "")
+		pdf.CellFormat(colAmt, rowH, tr("Rp "+model.FormatAmount(expense)), "1", 0, "R", false, 0, "")
+		setNetColor(pdf, income-expense)
+		pdf.CellFormat(colAmt, rowH, tr("Rp "+model.FormatAmount(income-expense)), "1", 1, "R", false, 0, "")
+		pdf.SetTextColor(0, 0, 0)
+	}
+
+	var income, expense float64
+	for _, d := range days {
+		row("", recap.FormatDayShort(d.Date), d.Income, d.Expense)
+		income += d.Income
+		expense += d.Expense
+	}
+	row("B", "Total", income, expense)
+}
+
+// setNetColor colours a difference: green when positive, red when negative
+// (the same RGB as drawSummary), black when zero.
+func setNetColor(pdf *gofpdf.Fpdf, net float64) {
+	switch {
+	case net > 0:
+		pdf.SetTextColor(20, 130, 20)
+	case net < 0:
+		pdf.SetTextColor(180, 30, 30)
+	default:
+		pdf.SetTextColor(0, 0, 0)
+	}
 }
 
 // minLabeledSlicePct hides the on-slice text label for any wedge smaller

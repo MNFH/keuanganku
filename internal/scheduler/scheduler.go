@@ -212,7 +212,7 @@ func (s *Scheduler) sendReportFor(ctx context.Context, chatID, spreadsheetID, ti
 		return fmt.Errorf("get wallets: %w", err)
 	}
 
-	pdf, err := report.GenerateMonthly(title, txs, wallets)
+	pdf, err := report.GenerateMonthly(title, from, to, txs, wallets)
 	if err != nil {
 		return fmt.Errorf("generate pdf: %w", err)
 	}
