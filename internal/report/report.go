@@ -15,10 +15,10 @@ import (
 
 const maxChartBars = 6
 
-// GenerateMonthly builds a PDF report for the given title and transaction
+// GenerateMonthly builds a PDF report for the given title, period [from, to) and transaction
 // set, along with a snapshot of current wallet balances, and returns the
 // raw PDF bytes.
-func GenerateMonthly(title string, txs []model.Transaction, wallets []model.Wallet) ([]byte, error) {
+func GenerateMonthly(title string, from, to time.Time, txs []model.Transaction, wallets []model.Wallet) ([]byte, error) {
 	stats := recap.Compute(txs)
 
 	pdf := gofpdf.New("P", "mm", "A4", "")

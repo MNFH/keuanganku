@@ -485,7 +485,7 @@ func (h *MessageHandler) renderRekapPDF(ctx context.Context, sc *sheets.Client, 
 	if err != nil {
 		return Reply{Text: "❌ Gagal mengambil data dompet."}
 	}
-	pdf, err := report.GenerateMonthly(title, txs, wallets)
+	pdf, err := report.GenerateMonthly(title, from, to, txs, wallets)
 	if err != nil {
 		return Reply{Text: fmt.Sprintf("❌ Gagal membuat PDF: %v", err)}
 	}
