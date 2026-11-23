@@ -129,6 +129,19 @@ func TestCommand(t *testing.T) {
 		{"recap yesterday", Intent{Action: ActionRecap, Period: PeriodYesterday}, "/rekap kemarin"},
 		{"recap pdf", Intent{Action: ActionRecap, Period: PeriodLastMonth, WantPDF: true}, "/rekap bulanan lalu pdf"},
 		{"recap this month pdf", Intent{Action: ActionRecap, WantPDF: true}, "/rekap pdf"},
+
+		// History renders /riwayat [count] [period] [wallet]; every part optional.
+		{"history bare", Intent{Action: ActionHistory}, "/riwayat"},
+		{"history count", Intent{Action: ActionHistory, Count: 20}, "/riwayat 20"},
+		{"history this month is named", Intent{Action: ActionHistory, Period: PeriodThisMonth}, "/riwayat bulanan"},
+		{"history wallet and week", Intent{Action: ActionHistory, Period: PeriodThisWeek, Wallet: "GoPay"}, "/riwayat mingguan GoPay"},
+		{"history all parts", Intent{Action: ActionHistory, Count: 5, Period: PeriodLastMonth, Wallet: "Jago Kantong Belanja"},
+			"/riwayat 5 bulanan lalu Jago Kantong Belanja"},
+		// An unknown wallet must reach the command path, which answers
+		// "wallet not found" instead of listing everything.
+		{"history unknown wallet", Intent{Action: ActionHistory, WalletText: "Dana"}, "/riwayat Dana"},
+		{"history listed wallet wins over text", Intent{Action: ActionHistory, Wallet: "BCA", WalletText: "bca"}, "/riwayat BCA"},
+		{"history multi-line wallet text", Intent{Action: ActionHistory, WalletText: "Dana\nKantor"}, "/riwayat Dana Kantor"},
 	}
 
 	for _, tt := range tests {
@@ -192,7 +205,7 @@ func TestMutates(t *testing.T) {
 	}
 
 	readOnly := []Action{
-		ActionBalance, ActionRecap, ActionHelp, ActionUnknown,
+		ActionBalance, ActionRecap, ActionHistory, ActionHelp, ActionUnknown,
 		// /batal mutates, but it IS the undo — hinting at it would be circular.
 		ActionUndo,
 		// Adding a wallet is not undoable via /batal, so no hint.

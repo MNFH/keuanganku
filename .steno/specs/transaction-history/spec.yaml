@@ -1,0 +1,11 @@
+# machine-owned by steno; edit phase/approvals only via the CLI
+name: transaction-history
+title: Transaction History
+kind: feature
+mode: gated
+phase: done
+created: 2026-11-18
+approvals:
+  requirements: 2026-11-18
+  design: 2026-11-18
+  tasks: 2026-11-18

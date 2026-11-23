@@ -33,6 +33,7 @@ const (
 	ActionBalance   Action = "balance"
 	ActionRecap     Action = "recap"
 	ActionUndo      Action = "undo"
+	ActionHistory   Action = "history"
 	ActionHelp      Action = "help"
 	// ActionUnknown means the message wasn't a finance request the bot can
 	// act on. See Intent.Reply for how the caller should respond.
@@ -93,6 +94,14 @@ type Intent struct {
 	Description string  `json:"description"`
 	Period      Period  `json:"period"`
 	WantPDF     bool    `json:"want_pdf"`
+
+	// Count is how many entries a history request asked for; 0 when unstated.
+	Count int `json:"count"`
+	// WalletText is, for a history request, a wallet the user named that is
+	// not on their list, exactly as written. Wallet cannot carry it (it is
+	// restricted to listed names), and without it "riwayat Dana" would widen
+	// silently to the whole list instead of saying Dana does not exist.
+	WalletText string `json:"wallet_text"`
 
 	// Reply is what to say back when Action is ActionUnknown. It is empty for
 	// ordinary conversation that has nothing to do with money — the caller
@@ -256,6 +265,12 @@ func (in *Intent) normalize() {
 	if in.Period == Period(sentinelNone) {
 		in.Period = PeriodNone
 	}
+	if strings.EqualFold(strings.TrimSpace(in.WalletText), sentinelNone) {
+		in.WalletText = ""
+	}
+	if in.Count < 0 {
+		in.Count = 0
+	}
 	// Description is free text, not an enum, but the model still reaches for
 	// the sentinel when there is nothing to describe. Left alone it would be
 	// written into the sheet as a transaction literally described as "none".
@@ -309,6 +324,7 @@ ACTIONS
 - balance: user asks their balance or a summary. ("saldo berapa", "sisa duit")
 - recap: user asks a report for a period. Set period, and want_pdf if they ask for a PDF/file. ("rekap bulan ini", "laporan minggu lalu pdf")
 - undo: user wants to cancel the last entry. ("batal", "salah, hapus")
+- history: user wants to SEE a list of individual recent transactions, not totals. Set count if they say how many, period if they name one, and wallet. ("lihat transaksi terakhir", "riwayat gopay minggu ini", "10 transaksi terakhir"). A request for totals or a report is recap, not history.
 - help: user asks what the bot can do.
 - unknown: anything else. See the REPLY rules.
 
@@ -316,7 +332,10 @@ AMOUNTS
 Always resolve Indonesian shorthand to a plain number: "25rb"/"25k"/"25 ribu" = 25000, "1.5jt"/"1,5 juta" = 1500000, "300rb" = 300000. Amount must be a positive number. Never return a negative amount — an expense is already a reduction.
 
 NOT APPLICABLE
-For wallet, to_wallet, category and period, use the literal value "none" when the field does not apply to this message. Never leave them blank.
+For wallet, to_wallet, category, period and wallet_text, use the literal value "none" when the field does not apply to this message. Never leave them blank. Set count to 0 unless the action is history and the user said how many.
+
+HISTORY WALLET
+For history only: if the user names a wallet that is NOT on the list, set wallet to "none" and copy the name exactly as written into wallet_text. Otherwise wallet_text is "none".
 
 WALLETS
 Use a wallet name EXACTLY as listed, matching case. Map casually-typed names to the listed one ("gopay" -> "GoPay", "bca" -> "BCA"). Wallet names may contain spaces. If the message names no wallet, or names one that is not on the list, use "none" — never substitute a different wallet.
@@ -363,7 +382,7 @@ func responseSchema(wallets []string) *genai.Schema {
 				Enum: []string{
 					string(ActionExpense), string(ActionIncome), string(ActionTransfer),
 					string(ActionAddWallet), string(ActionBalance), string(ActionRecap),
-					string(ActionUndo), string(ActionHelp), string(ActionUnknown),
+					string(ActionUndo), string(ActionHistory), string(ActionHelp), string(ActionUnknown),
 				},
 				Description: "What the user wants to do.",
 			},
@@ -389,11 +408,19 @@ func responseSchema(wallets []string) *genai.Schema {
 					string(PeriodThisWeek), string(PeriodLastWeek),
 					string(PeriodToday), string(PeriodYesterday),
 				},
-				Description: `Recap window. "none" unless action is recap.`,
+				Description: `Recap or history window. "none" unless action is recap or history.`,
 			},
 			"want_pdf": {
 				Type:        genai.TypeBoolean,
 				Description: "True only when the user asked for a PDF or a file.",
+			},
+			"count": {
+				Type:        genai.TypeInteger,
+				Description: "For history: how many entries the user asked for. 0 otherwise.",
+			},
+			"wallet_text": {
+				Type:        genai.TypeString,
+				Description: `For history: a wallet the user named that is not on the list, exactly as written. "none" otherwise.`,
 			},
 			"reply": {
 				Type:        genai.TypeString,
@@ -402,11 +429,11 @@ func responseSchema(wallets []string) *genai.Schema {
 		},
 		Required: []string{
 			"action", "amount", "wallet", "to_wallet",
-			"category", "description", "period", "want_pdf", "reply",
+			"category", "description", "period", "want_pdf", "count", "wallet_text", "reply",
 		},
 		PropertyOrdering: []string{
 			"action", "amount", "wallet", "to_wallet",
-			"category", "description", "period", "want_pdf", "reply",
+			"category", "description", "period", "want_pdf", "count", "wallet_text", "reply",
 		},
 	}
 }

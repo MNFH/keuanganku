@@ -162,4 +162,19 @@ func TestLiveAppendOnlyLedger(t *testing.T) {
 	if !got["i1"] || !got["pre"] {
 		t.Errorf("active transactions missing from recap range: %v", got)
 	}
+
+	active, err := c.GetActiveTransactions(ctx)
+	must(err)
+	got = map[string]bool{}
+	for _, tx := range active {
+		got[tx.ID] = true
+	}
+	for _, id := range []string{"e1", "t-out", "t-in"} {
+		if got[id] {
+			t.Errorf("cancelled transaction %s still in active transactions", id)
+		}
+	}
+	if !got["i1"] || !got["pre"] {
+		t.Errorf("active transactions missing: %v", got)
+	}
 }

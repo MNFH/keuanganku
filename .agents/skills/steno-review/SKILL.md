@@ -1,0 +1,22 @@
+---
+name: steno-review
+description: Fresh-context review of a steno spec stage (requirements, design, tasks) or a drift check after implementation. Runs steno's own zero-history reviewers; hands off to EGM's egm-review only when the project sets `reviewer: egm` or the user asks for EGM. Use before approving a stage or after finishing a spec.
+---
+
+# steno-review — zero-history review
+
+Why: a reviewer that shares your conversation agrees with you. Reviewers must see only the packet.
+A review settles and removes. It never grows the spec on its own, and it ends: one full round, at most one verify round.
+
+## Steps
+1. `steno review --stage <requirements|design|tasks|drift>` → writes `reviews/<date>-<stage>-packet.md` and prints the round (`full` or `verify`), the size and any warning. Note the path; tell the user every warning. If it says nothing changed, go to step 7.
+2. **EGM, only on request.** If `.steno/config.yaml` sets `reviewer: egm` or the user asked for EGM in this request, and EGM is installed: invoke `egm-review` on that packet file (for `drift`, `egm-drift-report`), telling it which stage the file is; for requirements or tasks, add that it is not a design document, so no architecture, alternatives or risks sections are expected. Save its findings as `reviews/<date>-<stage>.md`. Go to step 5.
+3. **Otherwise** (the default) check whether this session can start sub-agents that do not inherit the conversation. If it cannot, stop and tell the user a fresh-context review is not possible here; do not review in your own context.
+4. Start one sub-agent per persona in `reviewers/` that applies to the stage (each file says which); in a verify round leave out `scope`. If a sub-agent type named `steno-reviewer-<persona>` is registered (Claude Code after `steno init`), use it and give it only the packet path. Otherwise start a plain sub-agent and give it only: the persona file, the packet path, read-only access. Merge duplicates and write `reviews/<date>-<stage>.md` (append `# Round N` after the first) in three groups: `## Decide`, `## Fix`, `## Notes for the next stage`, each line `- [sev] <id>: <finding> → <change or options>`.
+5. **Decide first.** Ask the user each `decide` finding, scope cuts before additions, one question at a time with the options and your pick. Never apply a `decide` on your own, and never turn one into new text before the user says yes. Write each answer and each rejected finding as one line in `reviews/<stage>-decisions.md` (`- <id>: <decision>, <reason>`); the next packet shows it to reviewers so they do not reopen it. A cut goes to `## Non-goals` with its trigger. A split is not a cut: before deleting anything, run `steno new <slug> --title "<Title>"` for the part that leaves, move its requirements, glossary terms and open questions into that spec's `requirements.md` (renumbered from R1; `steno lint` there), and only then replace them here with one `## Non-goals` line naming the new spec. Tell the user the new spec exists and is still at requirements.
+6. **Then fix.** Drop every `fix` on an item that was cut. Apply the rest: a `fix` rewrites or deletes existing text and adds no criterion, section or task. Leave `note` findings in the findings file; do not edit them into the document. Run `steno lint`, then list each applied `fix` to the user in one line.
+7. **Gate.** The review has passed when no high `fix` is open and every `decide` has an answer. Say so, give the size before and after, and offer `steno approve <stage>`. Offer one verify round (step 1 again) only if step 6 changed the document and a high finding was among the fixes. After the verify round, or when the CLI warns about the round limit, do not start another: list what is still open and let the user approve, edit or ask for `steno review --full`.
+8. **Open questions.** If the document still lists entries under `## Open questions`, list them numbered and ask the user to pick: **Interview** (offer first; one question at a time with your recommended answer and its trade-off; after each answer edit the document, delete the question (and the heading with the last one), confirm in one line; "skip" and "stop" are allowed; finish with `steno lint`), **Edit myself** (when the user says done, run `steno lint` and re-list what is open), or **Skip** (`steno approve <stage>`; the questions are settled in the next stage). Skip this step for `drift`.
+
+## Personas (reviewers/)
+scope · completeness · clarity · code-fit · implementability · ears

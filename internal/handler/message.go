@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nurfaizh/keuanganku/internal/ai"
+	"github.com/nurfaizh/keuanganku/internal/history"
 	"github.com/nurfaizh/keuanganku/internal/model"
 	"github.com/nurfaizh/keuanganku/internal/recap"
 	"github.com/nurfaizh/keuanganku/internal/report"
@@ -141,6 +142,8 @@ func (h *MessageHandler) handleCommand(ctx context.Context, senderJID, text stri
 		return Reply{Text: h.cmdSummary(ctx, sheetsClient)}
 	case "/rekap":
 		return h.cmdRekap(ctx, sheetsClient, args)
+	case "/riwayat", "/history":
+		return Reply{Text: h.cmdRiwayat(ctx, sheetsClient, args)}
 	case "/batal":
 		return Reply{Text: h.cmdBatal(ctx, sheetsClient)}
 	case "/hapus":
@@ -199,7 +202,8 @@ func (h *MessageHandler) handleNaturalLanguage(ctx context.Context, chatJID stri
 
 	// With a single wallet there is nothing to disambiguate, so don't make the
 	// user name it.
-	if intent.Wallet == "" && len(names) == 1 && intent.Action != ai.ActionTransfer {
+	// History is excluded: there, no wallet means every wallet.
+	if intent.Wallet == "" && len(names) == 1 && intent.Action != ai.ActionTransfer && intent.Action != ai.ActionHistory {
 		intent.Wallet = names[0]
 	}
 
@@ -432,37 +436,36 @@ func (h *MessageHandler) cmdRekap(ctx context.Context, sc *sheets.Client, args [
 		args = args[:n-1]
 	}
 
-	now := time.Now()
-	var from, to time.Time
-	var title, errMsg string
-
-	if len(args) == 0 {
-		from, to = recap.MonthRange(now, 0)
-		title = fmt.Sprintf("Rekap Bulanan — %s %d", recap.IndoMonthName(from.Month()), from.Year())
-	} else {
-		period := strings.ToLower(args[0])
-		rest := args[1:]
-		switch period {
-		case "bulan", "bulanan", "month", "monthly":
-			from, to, title, errMsg = resolveMonthRange(now, rest)
-		case "minggu", "mingguan", "week", "weekly":
-			from, to, title, errMsg = resolveWeekRange(now, rest)
-		case "harian", "hari", "today", "day", "daily":
-			from, to, title, errMsg = resolveDayRange(now, rest)
-		case "kemarin", "yesterday":
-			from, to, title, errMsg = resolveDayRange(now, []string{"lalu"})
-		default:
-			errMsg = rekapFormatHelp()
-		}
-	}
-
+	p, errMsg := resolveRekap(time.Now(), args)
 	if errMsg != "" {
 		return Reply{Text: errMsg}
 	}
+	title := "Rekap " + p.Kind + " — " + p.Label
 	if wantPDF {
-		return h.renderRekapPDF(ctx, sc, title, from, to)
+		return h.renderRekapPDF(ctx, sc, title, p.From, p.To)
 	}
-	return Reply{Text: h.renderRekap(ctx, sc, title, from, to)}
+	return Reply{Text: h.renderRekap(ctx, sc, title, p.From, p.To)}
+}
+
+// resolveRekap turns /rekap's arguments (without "pdf") into a period. No
+// arguments means the current month. Every argument must belong to the
+// period: a leftover word is reported rather than silently ignored, so a
+// typo like "/rekap bulan janauri" never falls back to this month.
+func resolveRekap(now time.Time, args []string) (*period, string) {
+	if len(args) == 0 {
+		from, to := recap.MonthRange(now, 0)
+		return monthOf(from, to), ""
+	}
+	p, used, errMsg := parsePeriod(now, args)
+	switch {
+	case errMsg != "":
+		return nil, errMsg
+	case p == nil:
+		return nil, rekapFormatHelp()
+	case used < len(args):
+		return nil, fmt.Sprintf("❌ Tidak dikenali: *%s*\n\n", strings.Join(args[used:], " ")) + rekapFormatHelp()
+	}
+	return p, ""
 }
 
 func (h *MessageHandler) renderRekap(ctx context.Context, sc *sheets.Client, title string, from, to time.Time) string {
@@ -504,132 +507,6 @@ func rekapFormatHelp() string {
 		"Tambahkan *pdf* di akhir untuk laporan PDF, contoh: /rekap bulan januari 2025 pdf"
 }
 
-func isPrevPeriodKeyword(s string) bool {
-	switch strings.ToLower(s) {
-	case "lalu", "kemarin", "sebelumnya":
-		return true
-	}
-	return false
-}
-
-// resolveMonthRange handles: (none) | lalu | <nama_bulan> [tahun]
-func resolveMonthRange(now time.Time, rest []string) (from, to time.Time, title, errMsg string) {
-	offset := 0
-	switch {
-	case len(rest) == 0:
-		// current month
-	case len(rest) == 1 && isPrevPeriodKeyword(rest[0]):
-		offset = -1
-	default:
-		month, ok := recap.ParseIndoMonth(rest[0])
-		if !ok {
-			return time.Time{}, time.Time{}, "", fmt.Sprintf("❌ Nama bulan tidak dikenali: *%s*\nContoh: /rekap bulan januari 2025", rest[0])
-		}
-		year := now.Year()
-		if len(rest) >= 2 {
-			y, err := strconv.Atoi(rest[1])
-			if err != nil || y < 2000 || y > 2100 {
-				return time.Time{}, time.Time{}, "", fmt.Sprintf("❌ Tahun tidak valid: *%s*", rest[1])
-			}
-			year = y
-		}
-		first := time.Date(year, month, 1, 0, 0, 0, 0, now.Location())
-		return first, first.AddDate(0, 1, 0), fmt.Sprintf("Rekap Bulanan — %s %d", recap.IndoMonthName(month), year), ""
-	}
-
-	from, to = recap.MonthRange(now, offset)
-	title = fmt.Sprintf("Rekap Bulanan — %s %d", recap.IndoMonthName(from.Month()), from.Year())
-	return from, to, title, ""
-}
-
-// resolveWeekRange handles: (none) | lalu | <tanggal> [nama_bulan] [tahun]
-func resolveWeekRange(now time.Time, rest []string) (from, to time.Time, title, errMsg string) {
-	offset := 0
-	switch {
-	case len(rest) == 0:
-		// current week
-	case len(rest) == 1 && isPrevPeriodKeyword(rest[0]):
-		offset = -1
-	default:
-		day, err := strconv.Atoi(rest[0])
-		if err != nil || day < 1 || day > 31 {
-			return time.Time{}, time.Time{}, "", fmt.Sprintf("❌ Tanggal tidak valid: *%s*\nContoh: /rekap minggu 3 januari 2026", rest[0])
-		}
-		month := now.Month()
-		year := now.Year()
-		if len(rest) >= 2 {
-			m, ok := recap.ParseIndoMonth(rest[1])
-			if !ok {
-				return time.Time{}, time.Time{}, "", fmt.Sprintf("❌ Nama bulan tidak dikenali: *%s*", rest[1])
-			}
-			month = m
-		}
-		if len(rest) >= 3 {
-			y, err := strconv.Atoi(rest[2])
-			if err != nil || y < 2000 || y > 2100 {
-				return time.Time{}, time.Time{}, "", fmt.Sprintf("❌ Tahun tidak valid: *%s*", rest[2])
-			}
-			year = y
-		}
-		ref := time.Date(year, month, day, 0, 0, 0, 0, now.Location())
-		from, to = recap.WeekRange(ref, 0)
-		return from, to, fmt.Sprintf("Rekap Mingguan — %s", recap.FormatDateRange(from, to)), ""
-	}
-
-	from, to = recap.WeekRange(now, offset)
-	title = fmt.Sprintf("Rekap Mingguan — %s", recap.FormatDateRange(from, to))
-	return from, to, title, ""
-}
-
-// resolveDayRange handles: (none) | ini/sekarang | lalu | <tanggal> [nama_bulan] [tahun]
-func resolveDayRange(now time.Time, rest []string) (from, to time.Time, title, errMsg string) {
-	offset := 0
-	switch {
-	case len(rest) == 0:
-		// today
-	case len(rest) == 1 && isTodayKeyword(rest[0]):
-		// today (explicit)
-	case len(rest) == 1 && isPrevPeriodKeyword(rest[0]):
-		offset = -1
-	default:
-		day, err := strconv.Atoi(rest[0])
-		if err != nil || day < 1 || day > 31 {
-			return time.Time{}, time.Time{}, "", fmt.Sprintf("❌ Tanggal tidak valid: *%s*\nContoh: /rekap harian 15 januari 2026", rest[0])
-		}
-		month := now.Month()
-		year := now.Year()
-		if len(rest) >= 2 {
-			m, ok := recap.ParseIndoMonth(rest[1])
-			if !ok {
-				return time.Time{}, time.Time{}, "", fmt.Sprintf("❌ Nama bulan tidak dikenali: *%s*", rest[1])
-			}
-			month = m
-		}
-		if len(rest) >= 3 {
-			y, err := strconv.Atoi(rest[2])
-			if err != nil || y < 2000 || y > 2100 {
-				return time.Time{}, time.Time{}, "", fmt.Sprintf("❌ Tahun tidak valid: *%s*", rest[2])
-			}
-			year = y
-		}
-		ref := time.Date(year, month, day, 0, 0, 0, 0, now.Location())
-		from, to = recap.DayRange(ref, 0)
-		return from, to, fmt.Sprintf("Rekap Harian — %s", recap.FormatDate(from)), ""
-	}
-
-	from, to = recap.DayRange(now, offset)
-	title = fmt.Sprintf("Rekap Harian — %s", recap.FormatDate(from))
-	return from, to, title, ""
-}
-
-func isTodayKeyword(s string) bool {
-	switch strings.ToLower(s) {
-	case "ini", "sekarang":
-		return true
-	}
-	return false
-}
-
 func formatRecap(title string, txs []model.Transaction) string {
 	stats := recap.Compute(txs)
 
@@ -658,6 +535,35 @@ func formatCategoryBreakdown(entries []recap.CategoryTotal) string {
 	}
 	return b.String()
 }
+
+// /riwayat [jumlah] [periode] [dompet] — list recent transactions, newest
+// first, marking the one /batal would cancel. Read-only: it never adds or
+// cancels anything (the housekeeping in handleCommand runs as for every
+// command).
+func (h *MessageHandler) cmdRiwayat(ctx context.Context, sc *sheets.Client, args []string) string {
+	wallets, err := sc.GetWallets(ctx)
+	if err != nil {
+		log.Printf("riwayat: get wallets: %v", err)
+		return historyLoadError
+	}
+	now := time.Now()
+	a, reply := parseHistoryArgs(now, wallets, args)
+	if reply != "" {
+		return reply
+	}
+	active, err := sc.GetActiveTransactions(ctx)
+	if err != nil {
+		log.Printf("riwayat: get transactions: %v", err)
+		return historyLoadError
+	}
+	q := history.Query{Wallet: a.Wallet, Limit: a.Count}
+	if a.Period != nil {
+		q.HasPeriod, q.From, q.To = true, a.Period.From, a.Period.To
+	}
+	return formatHistory(history.Select(active, q), a, now)
+}
+
+const historyLoadError = "❌ Gagal memuat riwayat transaksi. Coba lagi sebentar."
 
 // /batal — undo the most recently recorded transaction by marking it cancelled
 // in the sheet (the row stays as history). If it is one leg of a /transfer
@@ -851,6 +757,8 @@ _Nama dompet boleh lebih dari satu kata, contoh: /transfer 500rb Jago Kantong Be
 /rekap minggu <tanggal> [bulan] [tahun] — contoh: /rekap minggu 3 januari 2026
 /rekap harian <tanggal> [bulan] [tahun] — contoh: /rekap harian 15 januari 2026
 Tambahkan *pdf* di akhir untuk laporan PDF, contoh: /rekap bulan lalu pdf
+
+` + historyHelp + `
 
 ↩️ *Batal:*
 /batal  — batalkan transaksi terakhir
