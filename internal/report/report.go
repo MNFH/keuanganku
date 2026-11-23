@@ -60,6 +60,12 @@ func GenerateMonthly(title string, from, to time.Time, txs []model.Transaction, 
 	pdf.Ln(6)
 	drawWalletTable(pdf, tr, contentW, wallets)
 
+	// A single-day period already has its figures in the summary above.
+	if days := recap.Daily(txs, from, to); len(days) > 1 {
+		pdf.Ln(6)
+		drawDailyTable(pdf, tr, contentW, days)
+	}
+
 	var buf bytes.Buffer
 	if err := pdf.Output(&buf); err != nil {
 		return nil, fmt.Errorf("render pdf: %w", err)
@@ -150,6 +156,56 @@ func drawWalletTable(pdf *gofpdf.Fpdf, tr func(string) string, w float64, wallet
 	pdf.SetFont("Helvetica", "B", 10)
 	pdf.CellFormat(colName, 7, tr("Total"), "1", 0, "L", false, 0, "")
 	pdf.CellFormat(colBal, 7, tr("Rp "+model.FormatAmount(total)), "1", 1, "R", false, 0, "")
+}
+
+// drawDailyTable renders one row per day (date, income, expense, difference)
+// and a bold total row summed from those rows. Only the difference cell is
+// coloured, the same way drawSummary colours the period's difference; no
+// row is otherwise emphasised.
+func drawDailyTable(pdf *gofpdf.Fpdf, tr func(string) string, w float64, days []recap.DailyTotal) {
+	pdf.SetFont("Helvetica", "B", 12)
+	pdf.CellFormat(w, 8, tr("Rincian Harian"), "", 1, "L", false, 0, "")
+
+	colDate, colAmt := w*0.31, w*0.23
+
+	pdf.SetFont("Helvetica", "B", 10)
+	pdf.SetFillColor(230, 230, 230)
+	pdf.CellFormat(colDate, 7, tr("Tanggal"), "1", 0, "L", true, 0, "")
+	pdf.CellFormat(colAmt, 7, tr("Pemasukan"), "1", 0, "R", true, 0, "")
+	pdf.CellFormat(colAmt, 7, tr("Pengeluaran"), "1", 0, "R", true, 0, "")
+	pdf.CellFormat(colAmt, 7, tr("Selisih"), "1", 1, "R", true, 0, "")
+
+	row := func(label string, income, expense float64) {
+		pdf.CellFormat(colDate, 7, tr(label), "1", 0, "L", false, 0, "")
+		pdf.CellFormat(colAmt, 7, tr("Rp "+model.FormatAmount(income)), "1", 0, "R", false, 0, "")
+		pdf.CellFormat(colAmt, 7, tr("Rp "+model.FormatAmount(expense)), "1", 0, "R", false, 0, "")
+		setNetColor(pdf, income-expense)
+		pdf.CellFormat(colAmt, 7, tr("Rp "+model.FormatAmount(income-expense)), "1", 1, "R", false, 0, "")
+		pdf.SetTextColor(0, 0, 0)
+	}
+
+	pdf.SetFont("Helvetica", "", 10)
+	var income, expense float64
+	for _, d := range days {
+		row(recap.FormatDayShort(d.Date), d.Income, d.Expense)
+		income += d.Income
+		expense += d.Expense
+	}
+	pdf.SetFont("Helvetica", "B", 10)
+	row("Total", income, expense)
+}
+
+// setNetColor colours a difference: green when positive, red when negative
+// (the same RGB as drawSummary), black when zero.
+func setNetColor(pdf *gofpdf.Fpdf, net float64) {
+	switch {
+	case net > 0:
+		pdf.SetTextColor(20, 130, 20)
+	case net < 0:
+		pdf.SetTextColor(180, 30, 30)
+	default:
+		pdf.SetTextColor(0, 0, 0)
+	}
 }
 
 // minLabeledSlicePct hides the on-slice text label for any wedge smaller
